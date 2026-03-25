@@ -53,6 +53,9 @@ def parse_args():
     p.add_argument("--seismic", action="store_true",
                    help="Use physically motivated seismic model: linear FIR coupling "
                         "with OU-drifting resonance parameters (replaces polynomial model)")
+    p.add_argument("--tilt-coupling", action="store_true",
+                   help="Add bilinear tilt-to-length cross-coupling "
+                        "(seismic + multi-source only): C_T2L = T(t)·θ(t)·w1(t)")
     return p.parse_args()
 
 
@@ -75,6 +78,7 @@ def main():
         config = SeismicConfig(
             multi_source=args.multi_source,
             regime_changes=args.regime_changes,
+            tilt_coupling=args.tilt_coupling,
         )
     else:
         config = SignalConfig(

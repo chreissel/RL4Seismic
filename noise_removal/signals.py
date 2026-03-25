@@ -370,11 +370,37 @@ class SignalSimulator:
 #    (different resonance frequency / gain), representing sudden coupling
 #    path changes after lock-loss/reacquisition or alignment corrections.
 #
+#
 # 5. Multi-source: two seismometers with INDEPENDENT linear FIR couplings.
 #    This is still a linear (separable) multi-channel problem — a sufficiently
 #    long LMS filter with both inputs can in principle solve it, so the
 #    challenge is purely adaptation speed and filter length, not nonlinearity.
 #    (Contrast with the polynomial --multi-source cross-term E·w1·w2.)
+#
+# 6. Tilt-to-length (T2L) cross-coupling (multi_source + tilt_coupling).
+#    In LIGO-like detectors, ground tilt θ(t) is a primary noise source at
+#    low frequencies.  For Rayleigh waves, tilt is proportional to the
+#    horizontal derivative of vertical displacement:
+#
+#        θ(t)  ≈  (ω/c_R) · v_z(t)  →  H_tilt(z) ⊛ w2(t)
+#
+#    where H_tilt is a differentiator (highpass) and c_R the Rayleigh wave
+#    phase velocity.  θ then couples bilinearly into the main channel:
+#
+#        C_T2L(t) = T(t) · [H_tilt ⊛ w2(t)] · w1(t)
+#
+#    This product of two filtered channels CANNOT be cancelled by any linear
+#    two-channel filter (LMS/NLMS on [w1, w2]).  The irreducible floor for
+#    classical methods is  sqrt(rms(C_T2L)² + oracle²).  An RL agent that
+#    learns to compute the product can cancel it, giving a genuine advantage.
+#
+#    Physical justification:
+#      - The horizontal seismometer (w1) measures true horizontal translation
+#        plus a small tilt contamination: a_x ≈ Ẍ_x + g·θ.
+#      - The pendulum converts horizontal motion to test-mass displacement.
+#      - If the mirror is also tilted by θ, the effective T2L coupling is
+#        proportional to θ·x_horizontal — bilinear in θ and w1.
+#      - T(t) varies slowly with mirror alignment (OU process, hours timescale).
 
 @dataclass
 class SeismicConfig:
@@ -418,6 +444,16 @@ class SeismicConfig:
     w2_coupling_gain: float = 1.5
     w2_resonance_freq: float = 6.0      # Hz  — different resonance
     w2_resonance_q: float = 3.0
+
+    # --- tilt-to-length bilinear cross-coupling (requires multi_source=True) ---
+    # Models the Rayleigh-wave tilt-to-length mechanism:
+    #   C_T2L(t) = T(t) · [H_tilt ⊛ w2(t)] · w1(t)
+    # where H_tilt is a finite-difference approximation of d/dt (tilt proxy)
+    # and T(t) is an OU-drifting alignment-dependent coupling gain.
+    tilt_coupling: bool = False
+    t2l_gain: float = 0.8               # nominal T2L coupling gain
+    t2l_gain_drift_sigma: float = 0.2   # OU fluctuation of T2L gain
+    t2l_thermal_timescale: float = 600.0  # seconds — alignment changes slowly
 
 
 # ---------------------------------------------------------------------------
@@ -568,6 +604,7 @@ class SeismicSignalSimulator:
             regime = None
 
         witness2 = None
+        coupling_t2l = None
         if cfg.multi_source:
             witness2 = _seismic_ground_motion(
                 n, cfg.seismic_amplitude * 0.8, cfg.fs, self.rng
@@ -579,6 +616,10 @@ class SeismicSignalSimulator:
                 cfg.gain_drift_sigma * 0.8, cfg.freq_drift_sigma * 0.5,
             )
             coupling = coupling + coupling2
+
+            if cfg.tilt_coupling:
+                coupling_t2l = self._tilt_to_length_coupling(witness, witness2, n)
+                coupling = coupling + coupling_t2l
 
         main = true_signal + sensor_noise + coupling
 
@@ -592,6 +633,8 @@ class SeismicSignalSimulator:
         }
         if witness2 is not None:
             result["witness2"] = witness2
+        if coupling_t2l is not None:
+            result["coupling_t2l"] = coupling_t2l
         if regime is not None:
             result["regime"] = regime
         return result
@@ -668,3 +711,67 @@ class SeismicSignalSimulator:
         for i in range(M, n):
             coupling[i] = np.dot(filters[schedule[i]], witness[i - M:i][::-1])
         return coupling, schedule
+
+    def _tilt_to_length_coupling(
+        self, w1: np.ndarray, w2: np.ndarray, n: int
+    ) -> np.ndarray:
+        """
+        Bilinear tilt-to-length (T2L) cross-coupling:
+
+            C_T2L(t) = T(t) · θ_proxy(t) · w1(t)
+
+        Physical mechanism
+        ------------------
+        For Rayleigh waves, ground tilt θ is proportional to the temporal
+        derivative of vertical displacement:
+
+            θ(ω) = (ω / c_R) · v_z(ω)   →   θ ≈ (1/c_R) · dv_z/dt
+
+        In the time domain this is a first-difference (highpass) FIR applied
+        to the vertical seismometer w2:
+
+            θ_proxy[t] = w2[t] − w2[t−1]         (normalised)
+
+        θ then couples bilinearly with the horizontal motion w1 into the main
+        channel via the pendulum + mirror-alignment mechanism.  T(t) is the
+        alignment-dependent T2L gain, which drifts on the timescale of mirror
+        angular control corrections (typically tens of minutes to hours).
+
+        Why linear filters fail
+        -----------------------
+        C_T2L is the point-wise product of θ_proxy (a function of w2) and w1.
+        No linear combination of w1 and w2 can represent a product — the
+        Volterra kernel has support off the diagonal.  The NLMS floor is:
+
+            residual_floor ≥ sqrt(rms(C_T2L)² + oracle²)
+
+        An RL agent that learns to multiply θ_proxy by w1 can cancel C_T2L
+        and approach the oracle floor.
+        """
+        cfg = self.config
+
+        # --- tilt proxy: first-difference of vertical seismometer ---
+        # Δw2[t] = w2[t] − w2[t−1]  approximates dv_z/dt ∝ θ for Rayleigh waves.
+        # We use a normalised 2-tap FIR to keep units consistent.
+        tilt_proxy = np.empty(n)
+        tilt_proxy[0] = 0.0
+        tilt_proxy[1:] = w2[1:] - w2[:-1]
+        # Normalise to unit RMS so T2L gain has interpretable units
+        rms_tilt = float(np.sqrt(np.mean(tilt_proxy[1:]**2))) + 1e-12
+        tilt_proxy /= rms_tilt
+
+        # --- OU-drifting T2L gain (alignment-dependent) ---
+        T_gain = _ou_process(
+            n,
+            mean=cfg.t2l_gain,
+            sigma=cfg.t2l_gain_drift_sigma,
+            timescale=cfg.t2l_thermal_timescale,
+            fs=cfg.fs,
+            rng=self.rng,
+        )
+        T_gain = np.clip(T_gain, 0.05, cfg.t2l_gain * 2.5)
+
+        # --- bilinear product ---
+        # Normalise w1 contribution similarly so the gain is interpretable
+        rms_w1 = float(np.sqrt(np.mean(w1**2))) + 1e-12
+        return T_gain * tilt_proxy * (w1 / rms_w1)

@@ -292,6 +292,10 @@ def parse_args():
                    help="Evaluate on piecewise-constant coupling with sudden regime switches")
     p.add_argument("--seismic", action="store_true",
                    help="Use physically motivated seismic model (linear FIR + OU drift)")
+    p.add_argument("--tilt-coupling", action="store_true",
+                   help="Add bilinear tilt-to-length cross-coupling "
+                        "(seismic + multi-source only): C_T2L = T(t)·θ(t)·w1(t); "
+                        "creates an irreducible floor for all linear baselines")
     return p.parse_args()
 
 
@@ -302,6 +306,7 @@ def main():
         cfg = SeismicConfig(
             multi_source=args.multi_source,
             regime_changes=args.regime_changes,
+            tilt_coupling=args.tilt_coupling,
         )
         sim = SeismicSignalSimulator(cfg, seed=args.seed)
     else:
