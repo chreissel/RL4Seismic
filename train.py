@@ -44,6 +44,9 @@ def parse_args():
                    help="Path to save the trained model (without .zip)")
     p.add_argument("--log-dir", type=str, default="logs/ppo_noise_cancellation",
                    help="Tensorboard log directory")
+    p.add_argument("--multi-source", action="store_true",
+                   help="Enable second witness channel with cross-term coupling "
+                        "(harder for linear adaptive filters)")
     return p.parse_args()
 
 
@@ -62,7 +65,7 @@ def main():
     os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
     os.makedirs(args.log_dir, exist_ok=True)
 
-    config = SignalConfig()
+    config = SignalConfig(multi_source=args.multi_source)
 
     print("=" * 60)
     print("  RL Noise Cancellation — RecurrentPPO Training")
@@ -70,7 +73,10 @@ def main():
     print(f"  Sampling rate  : {config.fs} Hz")
     print(f"  Witness freq   : {config.witness_freq} Hz")
     print(f"  Sensor noise σ : {config.sensor_noise_sigma}")
-    print(f"  Coupling model : A(t)·w + B(t)·w² + C(t)·w³  (time-varying)")
+    if config.multi_source:
+        print(f"  Coupling model : A·w1 + B·w1² + C·w1³ + D·w2 + E·w1·w2  (multi-source)")
+    else:
+        print(f"  Coupling model : A(t)·w + B(t)·w² + C(t)·w³  (single-source)")
     print(f"  Window size    : {args.window_size} samples"
           f" = {args.window_size/config.fs:.3f} s")
     print(f"  Episode length : {args.episode_duration} s")

@@ -13,6 +13,8 @@ rapidly time-varying couplings — precisely where the RL agent should excel.
 
 from __future__ import annotations
 
+from typing import Optional
+
 import numpy as np
 
 
@@ -36,42 +38,68 @@ class LMSFilter:
         self.weights[:] = 0.0
         self._witness_buf[:] = 0.0
 
-    def update(self, witness_sample: float, main_sample: float) -> float:
+    def update(
+        self, witness_sample: float, main_sample: float, w2_sample: float = 0.0
+    ) -> float:
         """
         Process one sample and return the cleaned main-channel value.
 
-        Internally updates the filter weights using the LMS rule.
+        Parameters
+        ----------
+        witness_sample : current witness channel 1 sample
+        main_sample    : current main channel sample
+        w2_sample      : current witness channel 2 sample (optional, default 0)
 
         Returns
         -------
         main_clean : main_sample minus the linear coupling estimate
         """
-        # Shift buffer and insert new witness sample
         self._witness_buf = np.roll(self._witness_buf, 1)
         self._witness_buf[0] = witness_sample
 
-        # Predict and compute residual
         coupling_estimate = float(self.weights @ self._witness_buf)
         residual = main_sample - coupling_estimate
 
-        # LMS weight update
         self.weights += self.mu * residual * self._witness_buf
 
         return residual
 
-    def run(self, witness: np.ndarray, main: np.ndarray) -> np.ndarray:
+    def run(
+        self, witness: np.ndarray, main: np.ndarray, witness2: Optional[np.ndarray] = None
+    ) -> np.ndarray:
         """
         Process full arrays of data (online, sample by sample).
 
         Parameters
         ----------
-        witness : (N,) witness channel
-        main    : (N,) main channel
+        witness  : (N,) witness channel 1
+        main     : (N,) main channel
+        witness2 : (N,) witness channel 2 (optional).  When provided the
+                   filter length is doubled to 2·M and both channels are
+                   used as separate inputs (no cross-term product).
 
         Returns
         -------
         cleaned : (N,) main channel after LMS subtraction
         """
+        if witness2 is not None:
+            # Re-initialise with doubled filter length for two-channel input
+            M2 = 2 * self.M
+            weights2 = np.zeros(M2)
+            buf2 = np.zeros(M2)
+            self.reset()
+            N = len(main)
+            cleaned = np.empty(N)
+            for i in range(N):
+                buf2 = np.roll(buf2, 1)
+                buf2[0] = float(witness[i])
+                buf2[self.M] = float(witness2[i])  # second channel in upper half
+                coupling_estimate = float(weights2 @ buf2)
+                residual = float(main[i]) - coupling_estimate
+                weights2 += self.mu * residual * buf2
+                cleaned[i] = residual
+            return cleaned
+
         self.reset()
         N = len(main)
         cleaned = np.empty(N)

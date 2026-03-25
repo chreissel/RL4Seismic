@@ -22,6 +22,8 @@ RL formulation.
 
 from __future__ import annotations
 
+from typing import Optional
+
 import numpy as np
 
 
@@ -57,52 +59,80 @@ class IIRFilter:
         self._witness_buf[:]  = 0.0
         self._residual_buf[:] = 0.0
 
-    def update(self, witness_sample: float, main_sample: float) -> float:
+    def update(
+        self, witness_sample: float, main_sample: float, w2_sample: float = 0.0
+    ) -> float:
         """
         Process one sample and return the cleaned main-channel value.
 
-        Shifts the witness and residual buffers, computes the coupling
-        estimate, updates weights, then returns the residual e_t.
+        Parameters
+        ----------
+        witness_sample : current witness channel 1 sample
+        main_sample    : current main channel sample
+        w2_sample      : current witness channel 2 sample (used only when
+                         the filter was initialised with two-channel buffers)
 
         Returns
         -------
         residual : main_sample minus the IIR coupling estimate
         """
-        # Shift buffers (index 0 = most recent)
         self._witness_buf  = np.roll(self._witness_buf,  1)
         self._residual_buf = np.roll(self._residual_buf, 1)
         self._witness_buf[0] = witness_sample
-        # residual_buf[0] will be filled after we compute e_t
 
-        # Coupling estimate: feedforward + feedback
         coupling_estimate = (
             float(self.b @ self._witness_buf)
             + float(self.a @ self._residual_buf)
         )
         residual = main_sample - coupling_estimate
 
-        # Store residual into feedback buffer
         self._residual_buf[0] = residual
 
-        # Equation-error LMS update
         self.b += self.mu * residual * self._witness_buf
         self.a += self.mu * residual * self._residual_buf
 
         return residual
 
-    def run(self, witness: np.ndarray, main: np.ndarray) -> np.ndarray:
+    def run(
+        self, witness: np.ndarray, main: np.ndarray, witness2: Optional[np.ndarray] = None
+    ) -> np.ndarray:
         """
         Process full arrays of data (online, sample by sample).
 
         Parameters
         ----------
-        witness : (N,) witness channel
-        main    : (N,) main channel
+        witness  : (N,) witness channel 1
+        main     : (N,) main channel
+        witness2 : (N,) witness channel 2 (optional).  When provided the
+                   feedforward length is doubled to 2·M so both channels
+                   are used as separate inputs (no cross-term product).
 
         Returns
         -------
         cleaned : (N,) main channel after IIR subtraction
         """
+        if witness2 is not None:
+            # Re-initialise with doubled feedforward buffer for two-channel input
+            M2 = 2 * self.M
+            b2 = np.zeros(M2)
+            a2 = np.zeros(self.N)
+            w_buf = np.zeros(M2)
+            r_buf = np.zeros(self.N)
+            N = len(main)
+            cleaned = np.empty(N)
+            for i in range(N):
+                w_buf = np.roll(w_buf, 1)
+                r_buf = np.roll(r_buf, 1)
+                w_buf[0]      = float(witness[i])
+                w_buf[self.M] = float(witness2[i])
+                coupling_estimate = float(b2 @ w_buf) + float(a2 @ r_buf)
+                residual = float(main[i]) - coupling_estimate
+                r_buf[0] = residual
+                b2 += self.mu * residual * w_buf
+                a2 += self.mu * residual * r_buf
+                cleaned[i] = residual
+            return cleaned
+
         self.reset()
         N = len(main)
         cleaned = np.empty(N)

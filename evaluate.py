@@ -48,7 +48,8 @@ def rms(x: np.ndarray) -> float:
 
 def run_lms(data: dict, filter_length: int = 64, step_size: float = 5e-4) -> np.ndarray:
     filt = LMSFilter(filter_length=filter_length, step_size=step_size)
-    return filt.run(data["witness"], data["main"])
+    w2 = data.get("witness2")
+    return filt.run(data["witness"], data["main"], witness2=w2)
 
 
 def run_iir(
@@ -62,7 +63,8 @@ def run_iir(
         feedback_length=feedback_length,
         step_size=step_size,
     )
-    return filt.run(data["witness"], data["main"])
+    w2 = data.get("witness2")
+    return filt.run(data["witness"], data["main"], witness2=w2)
 
 
 def run_rl_agent(data: dict, model, vec_norm, window_size: int = 64) -> np.ndarray:
@@ -266,13 +268,15 @@ def parse_args():
                    help="Evaluation episode duration in seconds (default: 60)")
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--save-dir", default="results")
+    p.add_argument("--multi-source", action="store_true",
+                   help="Evaluate on multi-source coupling with cross-term w1·w2")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
 
-    cfg = SignalConfig()
+    cfg = SignalConfig(multi_source=args.multi_source)
     sim = SignalSimulator(cfg, seed=args.seed)
     data = sim.generate_episode(duration=args.duration, signal_amplitude=0.0)
 
@@ -297,8 +301,8 @@ def main():
         model_zip = args.model_path + ".zip"
         vecnorm   = args.model_path + "_vecnorm.pkl"
         if os.path.exists(model_zip) and os.path.exists(vecnorm):
-            from stable_baselines3 import PPO
-            model = PPO.load(model_zip)
+            from sb3_contrib import RecurrentPPO
+            model = RecurrentPPO.load(model_zip)
             print(f"Loaded model from {model_zip}")
             rl_clean = run_rl_agent(data, model, vecnorm, window_size=args.window_size)
             print("RL rollout done.")
