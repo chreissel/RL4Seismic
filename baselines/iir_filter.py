@@ -43,10 +43,13 @@ class IIRFilter:
         feedforward_length: int = 64,
         feedback_length: int = 64,
         step_size: float = 5e-4,
+        normalized: bool = False,
     ):
         self.M = feedforward_length
         self.N = feedback_length
         self.mu = step_size
+        self.normalized = normalized
+        self._eps = 1e-6
 
         self.b = np.zeros(feedforward_length)   # feedforward weights (witness)
         self.a = np.zeros(feedback_length)       # feedback weights (residuals)
@@ -76,20 +79,28 @@ class IIRFilter:
         -------
         residual : main_sample minus the IIR coupling estimate
         """
-        self._witness_buf  = np.roll(self._witness_buf,  1)
-        self._residual_buf = np.roll(self._residual_buf, 1)
+        self._witness_buf = np.roll(self._witness_buf, 1)
         self._witness_buf[0] = witness_sample
 
-        coupling_estimate = (
-            float(self.b @ self._witness_buf)
-            + float(self.a @ self._residual_buf)
-        )
+        coupling_estimate = float(self.b @ self._witness_buf)
+        if self.N > 0:
+            self._residual_buf = np.roll(self._residual_buf, 1)
+            coupling_estimate += float(self.a @ self._residual_buf)
+
         residual = main_sample - coupling_estimate
 
-        self._residual_buf[0] = residual
+        if self.N > 0:
+            self._residual_buf[0] = residual
 
-        self.b += self.mu * residual * self._witness_buf
-        self.a += self.mu * residual * self._residual_buf
+        if self.normalized:
+            power = (float(self._witness_buf @ self._witness_buf)
+                     + float(self._residual_buf @ self._residual_buf)
+                     + self._eps)
+            self.b += (self.mu / power) * residual * self._witness_buf
+            self.a += (self.mu / power) * residual * self._residual_buf
+        else:
+            self.b += self.mu * residual * self._witness_buf
+            self.a += self.mu * residual * self._residual_buf
 
         return residual
 
@@ -112,30 +123,30 @@ class IIRFilter:
         cleaned : (N,) main channel after IIR subtraction
         """
         if witness2 is not None:
-            # Re-initialise with doubled feedforward buffer for two-channel input.
-            # Use normalised LMS (NLMS) updates — divides by current input power —
-            # to guarantee stability when the coupling RMS is large (e.g. dominant
-            # cross-term).  Plain LMS can diverge because the IIR feedback weights
-            # grow unboundedly during the initial high-residual transient.
+            # Two-channel: doubled feedforward buffer, always NLMS for stability.
             M2 = 2 * self.M
             b2 = np.zeros(M2)
             a2 = np.zeros(self.N)
             w_buf = np.zeros(M2)
             r_buf = np.zeros(self.N)
-            eps = 1e-6          # regularisation to avoid division by zero
+            eps = self._eps
             N = len(main)
             cleaned = np.empty(N)
             for i in range(N):
                 w_buf = np.roll(w_buf, 1)
-                r_buf = np.roll(r_buf, 1)
                 w_buf[0]      = float(witness[i])
                 w_buf[self.M] = float(witness2[i])
-                coupling_estimate = float(b2 @ w_buf) + float(a2 @ r_buf)
+                coupling_estimate = float(b2 @ w_buf)
+                if self.N > 0:
+                    r_buf = np.roll(r_buf, 1)
+                    coupling_estimate += float(a2 @ r_buf)
                 residual = float(main[i]) - coupling_estimate
-                r_buf[0] = residual
-                power = float(w_buf @ w_buf) + float(r_buf @ r_buf) + eps
+                if self.N > 0:
+                    r_buf[0] = residual
+                power = float(w_buf @ w_buf) + (float(r_buf @ r_buf) if self.N > 0 else 0.0) + eps
                 b2 += (self.mu / power) * residual * w_buf
-                a2 += (self.mu / power) * residual * r_buf
+                if self.N > 0:
+                    a2 += (self.mu / power) * residual * r_buf
                 cleaned[i] = residual
             return cleaned
 

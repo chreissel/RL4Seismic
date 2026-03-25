@@ -35,6 +35,7 @@ import matplotlib.gridspec as gridspec
 from scipy.signal import welch
 
 from noise_removal import NoiseCancellationEnv, SignalConfig, SignalSimulator
+from noise_removal import SeismicConfig, SeismicSignalSimulator
 from baselines import LMSFilter, IIRFilter
 
 
@@ -46,8 +47,13 @@ def rms(x: np.ndarray) -> float:
     return float(np.sqrt(np.mean(x**2)))
 
 
-def run_lms(data: dict, filter_length: int = 64, step_size: float = 5e-4) -> np.ndarray:
-    filt = LMSFilter(filter_length=filter_length, step_size=step_size)
+def run_lms(
+    data: dict,
+    filter_length: int = 64,
+    step_size: float = 5e-4,
+    normalized: bool = False,
+) -> np.ndarray:
+    filt = LMSFilter(filter_length=filter_length, step_size=step_size, normalized=normalized)
     w2 = data.get("witness2")
     return filt.run(data["witness"], data["main"], witness2=w2)
 
@@ -57,11 +63,13 @@ def run_iir(
     feedforward_length: int = 64,
     feedback_length: int = 64,
     step_size: float = 5e-4,
+    normalized: bool = False,
 ) -> np.ndarray:
     filt = IIRFilter(
         feedforward_length=feedforward_length,
         feedback_length=feedback_length,
         step_size=step_size,
+        normalized=normalized,
     )
     w2 = data.get("witness2")
     return filt.run(data["witness"], data["main"], witness2=w2)
@@ -134,6 +142,7 @@ def plot_overview(
     rl_clean: Optional[np.ndarray],
     save_dir: str,
     fs: float = 128.0,
+    seismic: bool = False,
 ):
     t = data["time"]
     oracle_clean = data["sensor_noise"]  # best possible: coupling perfectly removed
@@ -142,18 +151,27 @@ def plot_overview(
     fig.suptitle("RL Noise Cancellation — Method Comparison", fontsize=14, fontweight="bold")
     gs = gridspec.GridSpec(3, 2, hspace=0.45, wspace=0.35)
 
-    # ---- Coupling coefficients over time ----
+    # ---- Top panel: coupling info ----
     ax0 = fig.add_subplot(gs[0, :])
-    from noise_removal.signals import TimeVaryingCoupling
-    coupling_obj = TimeVaryingCoupling(SignalConfig())
-    A, B, C = coupling_obj.coefficients(t)
-    ax0.plot(t, A, label="A(t) — linear", color="tab:blue")
-    ax0.plot(t, B, label="B(t) — quadratic", color="tab:orange")
-    ax0.plot(t, C, label="C(t) — cubic", color="tab:green")
-    ax0.set_xlabel("Time (s)")
-    ax0.set_ylabel("Coupling coefficient")
-    ax0.set_title("Time-varying coupling coefficients  f(w,t) = A(t)·w + B(t)·w² + C(t)·w³")
-    ax0.legend(loc="upper right", fontsize=9)
+    if seismic:
+        # Show the coupling waveform and witness for seismic model
+        ax0.plot(t, data["coupling"], lw=0.7, alpha=0.8, label="Coupling h(t)⊛w(t)", color="tab:blue")
+        ax0.plot(t, data["witness"], lw=0.6, alpha=0.5, label="Witness w(t)", color="tab:orange")
+        ax0.set_xlabel("Time (s)")
+        ax0.set_ylabel("Amplitude")
+        ax0.set_title("Seismic coupling: linear time-varying FIR  y(t) = h(t) ⊛ w(t) + n(t)")
+        ax0.legend(loc="upper right", fontsize=9)
+    else:
+        from noise_removal.signals import TimeVaryingCoupling
+        coupling_obj = TimeVaryingCoupling(SignalConfig())
+        A, B, C = coupling_obj.coefficients(t)
+        ax0.plot(t, A, label="A(t) — linear", color="tab:blue")
+        ax0.plot(t, B, label="B(t) — quadratic", color="tab:orange")
+        ax0.plot(t, C, label="C(t) — cubic", color="tab:green")
+        ax0.set_xlabel("Time (s)")
+        ax0.set_ylabel("Coupling coefficient")
+        ax0.set_title("Time-varying coupling coefficients  f(w,t) = A(t)·w + B(t)·w² + C(t)·w³")
+        ax0.legend(loc="upper right", fontsize=9)
     ax0.grid(alpha=0.3)
 
     # ---- Time-domain: zoom on first 5 s ----
@@ -272,31 +290,48 @@ def parse_args():
                    help="Evaluate on multi-source coupling with cross-term w1·w2")
     p.add_argument("--regime-changes", action="store_true",
                    help="Evaluate on piecewise-constant coupling with sudden regime switches")
+    p.add_argument("--seismic", action="store_true",
+                   help="Use physically motivated seismic model (linear FIR + OU drift)")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
 
-    cfg = SignalConfig(
-        multi_source=args.multi_source,
-        regime_changes=args.regime_changes,
-    )
-    sim = SignalSimulator(cfg, seed=args.seed)
+    if args.seismic:
+        cfg = SeismicConfig(
+            multi_source=args.multi_source,
+            regime_changes=args.regime_changes,
+        )
+        sim = SeismicSignalSimulator(cfg, seed=args.seed)
+    else:
+        cfg = SignalConfig(
+            multi_source=args.multi_source,
+            regime_changes=args.regime_changes,
+        )
+        sim = SignalSimulator(cfg, seed=args.seed)
     data = sim.generate_episode(duration=args.duration, signal_amplitude=0.0)
 
     print(f"Generated {args.duration:.0f} s of evaluation data  "
           f"(fs={cfg.fs} Hz, {len(data['time'])} samples)")
 
     # --- LMS baseline ---
-    lms_clean = run_lms(data, filter_length=args.window_size)
+    # NLMS is used for the seismic model: coloured 1/f² ground motion creates
+    # a large eigenvalue spread that causes plain LMS to diverge.
+    lms_clean = run_lms(data, filter_length=args.window_size, normalized=args.seismic)
     print("LMS filter done.")
 
     # --- IIR baseline ---
+    # For the seismic model the coupling is purely FIR (no IIR feedback in the
+    # physics), so the optimal IIR feedback weights are zero.  We set
+    # feedback_length=0 to avoid the equation-error instability that arises
+    # from a non-zero feedback length on coloured seismic signals.
+    iir_fb = 0 if args.seismic else args.window_size
     iir_clean = run_iir(
         data,
         feedforward_length=args.window_size,
-        feedback_length=args.window_size,
+        feedback_length=iir_fb,
+        normalized=args.seismic,
     )
     print("IIR filter done.")
 
@@ -316,7 +351,11 @@ def main():
             print("Proceeding without RL agent.")
 
     print_metrics(data, lms_clean, iir_clean, rl_clean)
-    plot_overview(data, lms_clean, iir_clean, rl_clean, save_dir=args.save_dir, fs=cfg.fs)
+    plot_overview(
+        data, lms_clean, iir_clean, rl_clean,
+        save_dir=args.save_dir, fs=cfg.fs,
+        seismic=args.seismic,
+    )
     print("\nDone. Figures saved to", args.save_dir)
 
 

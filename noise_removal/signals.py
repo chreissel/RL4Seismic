@@ -44,9 +44,10 @@ Regime-change (--regime-changes flag):
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
+from scipy.signal import butter, sosfilt
 
 
 # ---------------------------------------------------------------------------
@@ -346,3 +347,324 @@ class SignalSimulator:
         if regime is not None:
             result["regime"] = regime
         return result
+
+
+# ---------------------------------------------------------------------------
+# Seismic / LIGO-motivated model
+# ---------------------------------------------------------------------------
+#
+# Key differences from the polynomial toy model
+# -----------------------------------------------
+# 1. Coupling is a LINEAR time-varying FIR filter  y(t) = h(t) ⊛ w(t)
+#    This is physically correct: seismic coupling in LIGO is a mechanical
+#    transfer function (resonance), not a polynomial in amplitude.
+#
+# 2. Ground motion is COLOURED broadband noise (approximating a seismic
+#    spectrum with 1/f² roll-off below ~1 Hz), not a single-frequency sinusoid.
+#
+# 3. Parameter drift follows an Ornstein–Uhlenbeck (OU) process — the
+#    physically appropriate model for thermal fluctuations and slow alignment
+#    changes (timescale: minutes).
+#
+# 4. Regime changes are jumps between discrete coupling transfer functions
+#    (different resonance frequency / gain), representing sudden coupling
+#    path changes after lock-loss/reacquisition or alignment corrections.
+#
+# 5. Multi-source: two seismometers with INDEPENDENT linear FIR couplings.
+#    This is still a linear (separable) multi-channel problem — a sufficiently
+#    long LMS filter with both inputs can in principle solve it, so the
+#    challenge is purely adaptation speed and filter length, not nonlinearity.
+#    (Contrast with the polynomial --multi-source cross-term E·w1·w2.)
+
+@dataclass
+class SeismicConfig:
+    """
+    Physical parameters for the seismic noise cancellation problem.
+
+    Models a LIGO-like witness-based noise cancellation setup:
+      y(t) = h(t) ⊛ w(t)  +  n_sensor(t)
+    where h(t) is a slowly drifting resonant FIR coupling filter and
+    w(t) is broadband seismic ground motion.
+    """
+
+    # --- sampling ---
+    fs: float = 128.0
+
+    # --- seismic ground motion ---
+    seismic_amplitude: float = 1.0      # normalised RMS of witness channel
+    witness_noise_sigma: float = 0.02   # seismometer self-noise (small)
+
+    # --- coupling filter (resonant mechanical mode) ---
+    filter_length: int = 64             # FIR taps
+    coupling_gain: float = 2.0          # nominal coupling RMS gain
+    resonance_freq: float = 3.0         # Hz  — isolation system resonance
+    resonance_q: float = 4.0            # quality factor Q = f_r / bandwidth
+
+    # --- thermal / alignment drift (Ornstein–Uhlenbeck) ---
+    thermal_timescale: float = 300.0    # seconds  (≈ 5 min thermal time const.)
+    gain_drift_sigma: float = 0.5       # OU stationary std of gain fluctuation
+    freq_drift_sigma: float = 0.8       # OU stationary std of freq fluctuation (Hz)
+
+    # --- main channel sensor noise ---
+    sensor_noise_sigma: float = 0.05    # residual noise after passive isolation
+
+    # --- regime changes (sudden coupling path change) ---
+    regime_changes: bool = False
+    n_regimes: int = 4
+    mean_hold_time: float = 15.0        # seconds — avg hold between switches
+
+    # --- multi-source (second seismometer at independent location) ---
+    multi_source: bool = False
+    w2_coupling_gain: float = 1.5
+    w2_resonance_freq: float = 6.0      # Hz  — different resonance
+    w2_resonance_q: float = 3.0
+
+
+# ---------------------------------------------------------------------------
+# Seismic helpers
+# ---------------------------------------------------------------------------
+
+def _make_resonant_fir(
+    gain: float, f_r: float, Q: float, M: int, fs: float
+) -> np.ndarray:
+    """
+    FIR approximation to a damped resonance impulse response:
+
+        h[k] = exp(−α·k) · sin(ω_d·k),   k = 0, …, M−1
+
+    where α = π·f_r / (Q·fs) and ω_d is the damped natural frequency.
+    Normalised so  ‖h‖₂ = gain.
+
+    Physically: a seismic isolation stage modelled as a mass-spring-damper
+    system (Q ≈ 3–10 for typical suspension modes, f_r ≈ 1–10 Hz).
+    """
+    k = np.arange(M, dtype=float)
+    alpha = np.pi * f_r / (Q * fs)                   # decay per sample
+    omega_r = 2.0 * np.pi * f_r / fs
+    omega_d = omega_r * np.sqrt(max(1.0 - 1.0 / (4.0 * Q**2), 0.0))
+    h = np.exp(-alpha * k) * np.sin(omega_d * k)
+    norm = np.sqrt(np.dot(h, h))
+    if norm < 1e-12:
+        return np.zeros(M)
+    return (gain / norm) * h
+
+
+def _ou_process(
+    n: int,
+    mean: float,
+    sigma: float,
+    timescale: float,
+    fs: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """
+    Discrete Ornstein–Uhlenbeck process with mean-reversion:
+
+        X[i] = exp(−θ·dt)·X[i−1] + (1−exp(−θ·dt))·μ + noise[i]
+
+    where θ = 1/timescale, noise ~ N(0, σ·√(1−exp(−2θ·dt))).
+    Starts from the stationary distribution N(μ, σ²).
+    """
+    dt = 1.0 / fs
+    theta = 1.0 / timescale
+    exp_dt = np.exp(-theta * dt)
+    noise_std = sigma * np.sqrt(1.0 - exp_dt**2)
+
+    x = np.empty(n)
+    x[0] = mean + rng.normal(0.0, sigma)
+    raw_noise = rng.normal(0.0, noise_std, n)
+    for i in range(1, n):
+        x[i] = exp_dt * x[i - 1] + (1.0 - exp_dt) * mean + raw_noise[i]
+    return x
+
+
+def _seismic_ground_motion(
+    n: int, amplitude: float, fs: float, rng: np.random.Generator
+) -> np.ndarray:
+    """
+    Broadband coloured noise approximating a seismic ground-motion spectrum.
+
+    Method: integrate white noise (→ 1/f² brownian PSD), then bandpass
+    [0.1, 20] Hz.  This captures the dominant energy at low frequencies
+    while avoiding DC drift and aliasing.
+
+    The result is normalised to RMS = amplitude.
+    """
+    extra = 512  # discard filter transient
+    white = rng.normal(0.0, 1.0, n + extra)
+    brown = np.cumsum(white) / np.sqrt(n + extra)
+
+    f_low  = 0.1 / (fs / 2.0)
+    f_high = min(20.0, fs * 0.45) / (fs / 2.0)
+    sos = butter(4, [f_low, f_high], btype="band", output="sos")
+    filtered = sosfilt(sos, brown)[extra:]
+
+    rms_val = np.sqrt(np.mean(filtered**2))
+    return amplitude * filtered / (rms_val + 1e-12)
+
+
+# ---------------------------------------------------------------------------
+# Seismic simulator
+# ---------------------------------------------------------------------------
+
+class SeismicSignalSimulator:
+    """
+    Generates one episode of seismic noise cancellation data.
+
+    The coupling is a linear time-varying FIR filter (resonant mechanical
+    transfer function) rather than a polynomial in witness amplitude.
+    Parameters drift via Ornstein–Uhlenbeck (thermal) or step-change
+    (coupling-path switch).
+
+    Returns the same dict structure as SignalSimulator so the environment
+    and baselines can be used unchanged.
+
+    Usage
+    -----
+    >>> cfg = SeismicConfig()
+    >>> sim = SeismicSignalSimulator(cfg, seed=0)
+    >>> data = sim.generate_episode(duration=30.0)
+    >>> data.keys()
+    dict_keys(['time', 'witness', 'main', 'coupling', 'sensor_noise', 'true_signal'])
+    """
+
+    def __init__(self, config: SeismicConfig, seed: Optional[int] = None):
+        self.config = config
+        self.rng = np.random.default_rng(seed)
+
+    def generate_episode(
+        self,
+        duration: float,
+        signal_amplitude: float = 0.0,
+        signal_freq: float = 10.0,
+    ) -> dict:
+        cfg = self.config
+        n = int(duration * cfg.fs)
+        t = np.arange(n) / cfg.fs
+
+        # --- witness channel (seismic ground motion + self-noise) ---
+        witness = _seismic_ground_motion(n, cfg.seismic_amplitude, cfg.fs, self.rng)
+        witness += self.rng.normal(0.0, cfg.witness_noise_sigma, n)
+
+        # --- sensor noise (small residual in main channel) ---
+        sensor_noise = self.rng.normal(0.0, cfg.sensor_noise_sigma, n)
+
+        # --- injected test signal (zero during training) ---
+        true_signal = (
+            signal_amplitude * np.sin(2.0 * np.pi * signal_freq * t)
+            if signal_amplitude > 0
+            else np.zeros(n)
+        )
+
+        # --- coupling ---
+        if cfg.regime_changes:
+            coupling, regime = self._regime_coupling(witness, n)
+        else:
+            coupling = self._drifting_coupling(
+                witness, n,
+                cfg.coupling_gain, cfg.resonance_freq, cfg.resonance_q,
+                cfg.gain_drift_sigma, cfg.freq_drift_sigma,
+            )
+            regime = None
+
+        witness2 = None
+        if cfg.multi_source:
+            witness2 = _seismic_ground_motion(
+                n, cfg.seismic_amplitude * 0.8, cfg.fs, self.rng
+            )
+            witness2 += self.rng.normal(0.0, cfg.witness_noise_sigma, n)
+            coupling2 = self._drifting_coupling(
+                witness2, n,
+                cfg.w2_coupling_gain, cfg.w2_resonance_freq, cfg.w2_resonance_q,
+                cfg.gain_drift_sigma * 0.8, cfg.freq_drift_sigma * 0.5,
+            )
+            coupling = coupling + coupling2
+
+        main = true_signal + sensor_noise + coupling
+
+        result = {
+            "time": t,
+            "witness": witness,
+            "main": main,
+            "coupling": coupling,
+            "sensor_noise": sensor_noise,
+            "true_signal": true_signal,
+        }
+        if witness2 is not None:
+            result["witness2"] = witness2
+        if regime is not None:
+            result["regime"] = regime
+        return result
+
+    # ------------------------------------------------------------------
+    # Internal coupling generators
+    # ------------------------------------------------------------------
+
+    def _drifting_coupling(
+        self,
+        witness: np.ndarray,
+        n: int,
+        nom_gain: float,
+        nom_freq: float,
+        Q: float,
+        gain_sigma: float,
+        freq_sigma: float,
+    ) -> np.ndarray:
+        """
+        Time-varying linear FIR coupling with OU-drifting parameters.
+
+        The resonance frequency and gain follow independent OU processes,
+        representing slow thermal / alignment drift.  The filter is
+        recomputed at each sample from the current parameters.
+        """
+        cfg = self.config
+        M = cfg.filter_length
+
+        gain_t = _ou_process(n, nom_gain, gain_sigma, cfg.thermal_timescale, cfg.fs, self.rng)
+        freq_t = _ou_process(n, nom_freq, freq_sigma, cfg.thermal_timescale, cfg.fs, self.rng)
+        gain_t = np.clip(gain_t, 0.3, 5.0)
+        freq_t = np.clip(freq_t, 0.5, cfg.fs / 4.0)
+
+        coupling = np.zeros(n)
+        for i in range(M, n):
+            h = _make_resonant_fir(gain_t[i], freq_t[i], Q, M, cfg.fs)
+            coupling[i] = np.dot(h, witness[i - M:i][::-1])
+        return coupling
+
+    def _regime_coupling(
+        self, witness: np.ndarray, n: int
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Piecewise-constant coupling: K pre-sampled FIR filters, Poisson switches.
+
+        Represents sudden coupling path changes (lock-loss, alignment jump).
+        Each regime has a different resonance frequency and gain, sampled
+        uniformly to span a realistic range.
+        """
+        cfg = self.config
+        K, M = cfg.n_regimes, cfg.filter_length
+
+        # Sample K distinct FIR filters
+        gains = self.rng.uniform(0.8, 3.5, K)
+        freqs = self.rng.uniform(1.0, 10.0, K)
+
+        filters = np.stack([
+            _make_resonant_fir(gains[k], freqs[k], cfg.resonance_q, M, cfg.fs)
+            for k in range(K)
+        ])  # (K, M)
+
+        # Poisson-distributed hold times
+        schedule = np.empty(n, dtype=np.int32)
+        pos = 0
+        regime = int(self.rng.integers(0, K))
+        while pos < n:
+            hold = max(1, int(self.rng.exponential(cfg.mean_hold_time * cfg.fs)))
+            end = min(pos + hold, n)
+            schedule[pos:end] = regime
+            pos = end
+            regime = int(self.rng.integers(0, K))
+
+        coupling = np.zeros(n)
+        for i in range(M, n):
+            coupling[i] = np.dot(filters[schedule[i]], witness[i - M:i][::-1])
+        return coupling, schedule

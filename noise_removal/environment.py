@@ -29,7 +29,7 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 
-from .signals import SignalConfig, SignalSimulator
+from .signals import SignalConfig, SignalSimulator, SeismicConfig, SeismicSignalSimulator
 
 
 class NoiseCancellationEnv(gym.Env):
@@ -61,7 +61,7 @@ class NoiseCancellationEnv(gym.Env):
         action_clip: float = 15.0,
     ):
         super().__init__()
-        self.config = config or SignalConfig()
+        self.config = config if config is not None else SignalConfig()
         self.window_size = window_size
         self.episode_duration = episode_duration
         self.action_clip = action_clip
@@ -89,7 +89,10 @@ class NoiseCancellationEnv(gym.Env):
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
         super().reset(seed=seed)
 
-        sim = SignalSimulator(self.config, seed=seed)
+        if isinstance(self.config, SeismicConfig):
+            sim = SeismicSignalSimulator(self.config, seed=seed)
+        else:
+            sim = SignalSimulator(self.config, seed=seed)
         self._data = sim.generate_episode(
             duration=self.episode_duration,
             signal_amplitude=0.0,
