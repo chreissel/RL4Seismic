@@ -1,14 +1,20 @@
 """
-Train a PPO agent on the NoiseCancellationEnv.
+Train a RecurrentPPO agent on the NoiseCancellationEnv.
+
+Uses sb3-contrib RecurrentPPO with MlpLstmPolicy so the agent maintains
+LSTM hidden state across timesteps within an episode.  This allows it to
+behave like an adaptive filter — observing residuals, updating its implicit
+internal model, and correcting — rather than applying a fixed open-loop
+mapping as a plain MLP would.
 
 Usage
 -----
     python train.py                          # default settings
-    python train.py --timesteps 1_000_000   # longer run
+    python train.py --timesteps 2_000_000   # longer run
     python train.py --save-path models/ppo  # custom output path
 
 The trained model is saved to  models/ppo_noise_cancellation.zip
-and a tensorboard log to  logs/ppo_noise_cancellation/
+and VecNormalize stats to      models/ppo_noise_cancellation_vecnorm.pkl
 
 Quick sanity check after training:
     python evaluate.py
@@ -17,7 +23,7 @@ Quick sanity check after training:
 import argparse
 import os
 
-from stable_baselines3 import PPO
+from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import VecNormalize
 
@@ -59,7 +65,7 @@ def main():
     config = SignalConfig()
 
     print("=" * 60)
-    print("  RL Noise Cancellation — PPO Training")
+    print("  RL Noise Cancellation — RecurrentPPO Training")
     print("=" * 60)
     print(f"  Sampling rate  : {config.fs} Hz")
     print(f"  Witness freq   : {config.witness_freq} Hz")
@@ -79,19 +85,24 @@ def main():
     )
     vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
 
-    # PPO agent — tuned for closed-loop noise cancellation
-    model = PPO(
-        "MlpPolicy",
+    # RecurrentPPO — LSTM hidden state lets the agent adapt within an episode,
+    # mimicking an online adaptive filter rather than a fixed open-loop mapping.
+    model = RecurrentPPO(
+        "MlpLstmPolicy",
         vec_env,
-        n_steps=4096,            # more samples per rollout → lower gradient variance
+        n_steps=4096,
         batch_size=256,
         n_epochs=10,
         learning_rate=3e-4,
         gamma=0.99,
         gae_lambda=0.95,
-        clip_range=0.1,          # tighter clipping → stable updates (was causing collapse at 0.2)
-        ent_coef=1e-4,           # less exploration pressure at convergence
-        policy_kwargs=dict(net_arch=[256, 256]),
+        clip_range=0.1,
+        ent_coef=1e-4,
+        policy_kwargs=dict(
+            net_arch=[256, 256],
+            lstm_hidden_size=256,
+            n_lstm_layers=1,
+        ),
         tensorboard_log=None,
         verbose=1,
     )

@@ -66,14 +66,18 @@ def run_iir(
 
 
 def run_rl_agent(data: dict, model, vec_norm, window_size: int = 64) -> np.ndarray:
-    """Roll out the RL agent sample-by-sample on pre-generated data."""
+    """Roll out the RL agent sample-by-sample on pre-generated data.
+
+    Supports both plain PPO (MlpPolicy) and RecurrentPPO (MlpLstmPolicy).
+    For recurrent models the LSTM state is carried step-to-step so the agent
+    can adapt within the episode, just as it did during training.
+    """
     from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
     from noise_removal.environment import NoiseCancellationEnv
 
     n = len(data["time"])
     cleaned = data["main"].copy()
 
-    # Build a single-env wrapper that replays the pre-generated data
     cfg = SignalConfig()
     env = NoiseCancellationEnv(config=cfg, window_size=window_size)
 
@@ -85,19 +89,30 @@ def run_rl_agent(data: dict, model, vec_norm, window_size: int = 64) -> np.ndarr
 
     obs = env._get_obs()
 
-    # Wrap in VecNormalize-compatible format using DummyVecEnv
     dummy = DummyVecEnv([lambda: NoiseCancellationEnv(config=cfg, window_size=window_size)])
     dummy_norm = VecNormalize.load(vec_norm, dummy)
     dummy_norm.training = False
     dummy_norm.norm_reward = False
 
+    # Recurrent models need LSTM state and episode-start flag carried across steps
+    is_recurrent = hasattr(model, "policy") and hasattr(model.policy, "lstm_actor")
+    lstm_states = None
+    episode_start = np.ones((1,), dtype=bool)
+
     for t in range(window_size, n):
         obs_norm = dummy_norm.normalize_obs(obs[np.newaxis, :])
-        action, _ = model.predict(obs_norm, deterministic=True)
+
+        if is_recurrent:
+            action, lstm_states = model.predict(
+                obs_norm, state=lstm_states, episode_start=episode_start, deterministic=True
+            )
+            episode_start = np.zeros((1,), dtype=bool)
+        else:
+            action, _ = model.predict(obs_norm, deterministic=True)
+
         a = float(np.clip(action[0][0], -15.0, 15.0))
         cleaned[t] = data["main"][t] - a
 
-        # Store action so next observation uses the correct residual (closed loop)
         env._action_history[t] = a
         env._step_idx = t + 1
         if t + 1 < n:
