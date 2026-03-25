@@ -112,12 +112,17 @@ class IIRFilter:
         cleaned : (N,) main channel after IIR subtraction
         """
         if witness2 is not None:
-            # Re-initialise with doubled feedforward buffer for two-channel input
+            # Re-initialise with doubled feedforward buffer for two-channel input.
+            # Use normalised LMS (NLMS) updates — divides by current input power —
+            # to guarantee stability when the coupling RMS is large (e.g. dominant
+            # cross-term).  Plain LMS can diverge because the IIR feedback weights
+            # grow unboundedly during the initial high-residual transient.
             M2 = 2 * self.M
             b2 = np.zeros(M2)
             a2 = np.zeros(self.N)
             w_buf = np.zeros(M2)
             r_buf = np.zeros(self.N)
+            eps = 1e-6          # regularisation to avoid division by zero
             N = len(main)
             cleaned = np.empty(N)
             for i in range(N):
@@ -128,8 +133,9 @@ class IIRFilter:
                 coupling_estimate = float(b2 @ w_buf) + float(a2 @ r_buf)
                 residual = float(main[i]) - coupling_estimate
                 r_buf[0] = residual
-                b2 += self.mu * residual * w_buf
-                a2 += self.mu * residual * r_buf
+                power = float(w_buf @ w_buf) + float(r_buf @ r_buf) + eps
+                b2 += (self.mu / power) * residual * w_buf
+                a2 += (self.mu / power) * residual * r_buf
                 cleaned[i] = residual
             return cleaned
 

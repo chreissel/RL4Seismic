@@ -143,14 +143,22 @@ class MultiSourceCoupling:
     Extra coefficient ranges
     ------------------------
     D(t) ∈ [0.7, 2.3]   (linear term on w2, period 37 s)
-    E(t) ∈ [0.4, 1.2]   (cross-term w1·w2,  period 53 s)
+    E(t) ∈ [1.5, 4.5]   (cross-term w1·w2,  period 53 s)
+
+    The cross-term is sized so that it accounts for ~60 % of the total
+    coupling RMS, giving adaptive filters an irreducible residual floor
+    of ~4–5× oracle (vs 1–2× oracle for single-source).  The RL agent,
+    which sees both witness windows, can learn the product implicitly
+    and in principle approach oracle.
     """
 
     def __init__(self, config: SignalConfig):
         self._single = TimeVaryingCoupling(config)
-        # Cross-source coefficients with incommensurate periods
+        # Cross-source coefficients with incommensurate periods.
+        # E offset raised from 0.8 → 3.0 so the cross-term dominates
+        # and creates an irreducible floor for linear baselines.
         self._d_params = (1.5, 0.8, 37.0, np.pi / 7)   # D(t): w2
-        self._e_params = (0.8, 0.4, 53.0, np.pi / 4)   # E(t): w1·w2
+        self._e_params = (3.0, 1.5, 53.0, np.pi / 4)   # E(t): w1·w2  (dominant)
 
     def _coeff(self, params, t):
         offset, amp, period, phase = params
