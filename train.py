@@ -1,5 +1,5 @@
 """
-Train a RecurrentPPO agent on the NoiseCancellationEnv.
+Train a RecurrentPPO agent on the seismic NoiseCancellationEnv.
 
 Uses sb3-contrib RecurrentPPO with MlpLstmPolicy so the agent maintains
 LSTM hidden state across timesteps within an episode.  This allows it to
@@ -7,11 +7,17 @@ behave like an adaptive filter — observing residuals, updating its implicit
 internal model, and correcting — rather than applying a fixed open-loop
 mapping as a plain MLP would.
 
+The physically motivated seismic model (4 Hz, resonant FIR coupling,
+OU-drifting parameters) is always used.  Optional extensions:
+  --multi-source   : add a second seismometer channel
+  --tilt-coupling  : add bilinear tilt-to-length coupling (requires --multi-source)
+  --regime-changes : sudden coupling path switches (Poisson process)
+
 Usage
 -----
     python train.py                          # default settings
-    python train.py --timesteps 2_000_000   # longer run
-    python train.py --save-path models/ppo  # custom output path
+    python train.py --timesteps 5_000_000   # longer run
+    python train.py --multi-source --tilt-coupling
 
 The trained model is saved to  models/ppo_noise_cancellation.zip
 and VecNormalize stats to      models/ppo_noise_cancellation_vecnorm.pkl
@@ -29,45 +35,39 @@ from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import VecNormalize
 
-from noise_removal import NoiseCancellationEnv, SignalConfig, SeismicConfig
+from noise_removal import NoiseCancellationEnv, SeismicConfig
 from noise_removal.policy import DilatedCausalConvExtractor
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Train PPO noise-cancellation agent")
+    p = argparse.ArgumentParser(description="Train PPO seismic noise-cancellation agent")
     p.add_argument("--timesteps", type=int, default=2_000_000,
                    help="Total training timesteps (default: 2 000 000)")
     p.add_argument("--n-envs", type=int, default=4,
                    help="Number of parallel training environments (default: 4)")
     p.add_argument("--window-size", type=int, default=None,
                    help="Observation window in samples "
-                        "(default: 240 for seismic = 60 s @ 4 Hz, 64 otherwise)")
-    p.add_argument("--episode-duration", type=float, default=None,
-                   help="Episode length in seconds "
-                        "(default: 300 for seismic, 30 otherwise)")
+                        "(default: 240 = 60 s @ 4 Hz)")
+    p.add_argument("--episode-duration", type=float, default=300.0,
+                   help="Episode length in seconds (default: 300)")
     p.add_argument("--save-path", type=str, default="models/ppo_noise_cancellation",
                    help="Path to save the trained model (without .zip)")
     p.add_argument("--log-dir", type=str, default="logs/ppo_noise_cancellation",
                    help="Tensorboard log directory")
     p.add_argument("--multi-source", action="store_true",
-                   help="Enable second witness channel with cross-term coupling "
-                        "(harder for linear adaptive filters)")
+                   help="Enable second seismometer channel with independent FIR coupling")
     p.add_argument("--regime-changes", action="store_true",
                    help="Enable sudden coupling regime switches (Poisson process); "
                         "adaptive filters must re-converge after each jump")
-    p.add_argument("--seismic", action="store_true",
-                   help="Use physically motivated seismic model: linear FIR coupling "
-                        "with OU-drifting resonance parameters (replaces polynomial model)")
     p.add_argument("--tilt-coupling", action="store_true",
                    help="Add bilinear tilt-to-length cross-coupling "
-                        "(seismic + multi-source only): C_T2L = T(t)·θ(t)·w1(t)")
+                        "(requires --multi-source): C_T2L = T(t)·θ(t)·w1(t)")
     p.add_argument("--freq-reward", action="store_true",
-                   help="Use frequency-domain reward (DLS-style): reward improvement "
-                        "in band-limited power [freq-low, freq-high] Hz only")
-    p.add_argument("--freq-low", type=float, default=0.1,
-                   help="Lower edge of reward band in Hz (default: 0.1)")
-    p.add_argument("--freq-high", type=float, default=15.0,
-                   help="Upper edge of reward band in Hz (default: 15.0)")
+                   help="Use frequency-domain reward: improve power in [freq-low, freq-high] Hz")
+    p.add_argument("--freq-low", type=float, default=0.05,
+                   help="Lower edge of reward band in Hz (default: 0.05)")
+    p.add_argument("--freq-high", type=float, default=1.5,
+                   help="Upper edge of reward band in Hz (default: 1.5)")
     p.add_argument("--dilated-conv", action="store_true",
                    help="Use dilated causal convolution policy (PPO) instead of "
                         "LSTM policy (RecurrentPPO). Inspired by DeepMind DLS.")
@@ -79,7 +79,7 @@ def parse_args():
 
 
 def make_env(config, window_size, episode_duration,
-             freq_reward=False, freq_low=0.1, freq_high=15.0):
+             freq_reward=False, freq_low=0.05, freq_high=1.5):
     def _init():
         return NoiseCancellationEnv(
             config=config,
@@ -97,56 +97,35 @@ def main():
     os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
     os.makedirs(args.log_dir, exist_ok=True)
 
-    if args.seismic:
-        config = SeismicConfig(
-            multi_source=args.multi_source,
-            regime_changes=args.regime_changes,
-            tilt_coupling=args.tilt_coupling,
-        )
-    else:
-        config = SignalConfig(
-            multi_source=args.multi_source,
-            regime_changes=args.regime_changes,
-        )
+    config = SeismicConfig(
+        multi_source=args.multi_source,
+        regime_changes=args.regime_changes,
+        tilt_coupling=args.tilt_coupling,
+    )
 
-    # Seismic-aware defaults: 4 Hz sampling needs a larger window and longer episodes
-    window_size      = args.window_size      if args.window_size      is not None else (
-        config.filter_length if args.seismic else 64
-    )
-    episode_duration = args.episode_duration if args.episode_duration is not None else (
-        300.0 if args.seismic else 30.0
-    )
+    window_size = args.window_size if args.window_size is not None else config.filter_length
 
     algo_name = "PPO + DilatedCausalConv" if args.dilated_conv else "RecurrentPPO (LSTM)"
     print("=" * 60)
-    print(f"  RL Noise Cancellation — {algo_name}")
+    print(f"  RL Seismic Noise Cancellation — {algo_name}")
     print("=" * 60)
     print(f"  Sampling rate  : {config.fs} Hz")
-    if hasattr(config, "witness_freq"):
-        print(f"  Witness freq   : {config.witness_freq} Hz")
     print(f"  Sensor noise σ : {config.sensor_noise_sigma}")
-    if args.seismic:
-        if config.multi_source and getattr(config, "tilt_coupling", False):
-            print(f"  Coupling model : h1(t)⊛w1 + h2(t)⊛w2 + T(t)·θ(t)·w1  (seismic + T2L)")
-        elif config.multi_source:
-            print(f"  Coupling model : h_k⊛w  ({config.n_regimes} FIR regimes, "
-                  f"mean hold {config.mean_hold_time:.0f} s)  (seismic)")
-        else:
-            print(f"  Coupling model : h(t)⊛w  (seismic: OU-drifting resonant FIR)")
+    if config.multi_source and config.tilt_coupling:
+        print(f"  Coupling model : h1(t)⊛w1 + h2(t)⊛w2 + T(t)·θ(t)·w1  (seismic + T2L)")
     elif config.multi_source:
-        print(f"  Coupling model : A·w1 + B·w1² + C·w1³ + D·w2 + E·w1·w2  (multi-source)")
+        print(f"  Coupling model : h1(t)⊛w1 + h2(t)⊛w2  (seismic multi-source)")
     elif config.regime_changes:
-        print(f"  Coupling model : A_k·w + B_k·w² + C_k·w³  ({config.n_regimes} regimes, "
+        print(f"  Coupling model : h_k⊛w  ({config.n_regimes} FIR regimes, "
               f"mean hold {config.mean_hold_time:.0f} s)")
     else:
-        print(f"  Coupling model : A(t)·w + B(t)·w² + C(t)·w³  (single-source)")
-    print(f"  Window size    : {window_size} samples"
-          f" = {window_size/config.fs:.3f} s")
-    print(f"  Episode length : {episode_duration} s")
+        print(f"  Coupling model : h(t)⊛w  (OU-drifting resonant FIR)")
+    print(f"  Window size    : {window_size} samples = {window_size/config.fs:.1f} s")
+    print(f"  Episode length : {args.episode_duration} s")
     print(f"  Total steps    : {args.timesteps:,}")
     print(f"  Parallel envs  : {args.n_envs}")
     if args.freq_reward:
-        print(f"  Reward         : band-limited [{args.freq_low}, {args.freq_high}] Hz (DLS-style)")
+        print(f"  Reward         : band-limited [{args.freq_low}, {args.freq_high}] Hz")
     else:
         print(f"  Reward         : broadband squared-error improvement")
     if args.dilated_conv:
@@ -156,9 +135,8 @@ def main():
         print(f"  Policy         : LSTM (RecurrentPPO, hidden=256)")
     print("=" * 60)
 
-    # Vectorised environment with observation normalisation
     vec_env = make_vec_env(
-        make_env(config, args.window_size, args.episode_duration,
+        make_env(config, window_size, args.episode_duration,
                  freq_reward=args.freq_reward,
                  freq_low=args.freq_low,
                  freq_high=args.freq_high),
@@ -167,14 +145,10 @@ def main():
     vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
 
     if args.dilated_conv:
-        # PPO + dilated causal convolution feature extractor (DLS-inspired).
-        # No recurrent state: the dilated conv covers the full observation window
-        # with a receptive field of 127 samples, giving the policy temporal context
-        # without vanishing-gradient issues.
         policy_kwargs = dict(
             features_extractor_class=DilatedCausalConvExtractor,
             features_extractor_kwargs=dict(
-                window_size=args.window_size,
+                window_size=window_size,
                 conv_channels=args.conv_channels,
                 n_layers=args.conv_layers,
             ),
@@ -196,8 +170,6 @@ def main():
             verbose=1,
         )
     else:
-        # RecurrentPPO — LSTM hidden state lets the agent adapt within an episode,
-        # mimicking an online adaptive filter rather than a fixed open-loop mapping.
         model = RecurrentPPO(
             "MlpLstmPolicy",
             vec_env,
@@ -228,7 +200,6 @@ def main():
 
     model.learn(total_timesteps=args.timesteps, callback=checkpoint_cb, progress_bar=False)
 
-    # Save model and normalisation statistics together
     model.save(args.save_path)
     vec_env.save(args.save_path + "_vecnorm.pkl")
 

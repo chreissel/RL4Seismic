@@ -1,6 +1,8 @@
-# ToysRL — RL Noise Cancellation
+# RL4Seismic — RL-Based Seismic Noise Cancellation
 
-A reinforcement learning environment for active noise cancellation, formulated as a **closed-loop control problem**. A PPO agent with an LSTM policy learns to track and subtract a nonlinear, time-varying coupling signal from a noisy main channel — benchmarked against classical adaptive filters (LMS, IIR).
+A reinforcement learning environment for active seismic noise cancellation, formulated as a **closed-loop control problem**. A PPO agent with an LSTM policy learns to track and subtract a physically motivated seismic coupling signal from a noisy main channel — benchmarked against classical adaptive filters (NLMS, IIR) and a supervised LSTM baseline.
+
+Inspired by and aligned with [arXiv:2511.19682](https://arxiv.org/abs/2511.19682) (Reissel et al., 2025).
 
 ---
 
@@ -9,18 +11,20 @@ A reinforcement learning environment for active noise cancellation, formulated a
 ### Closed-loop block diagram
 
 ```
-w_t ──→ [ Plant P(z) ] ──→ y_t = f(w_t, t) + n_t
-  │                               │
-  │                        ─── (+) ──→ e_t = y_t − a_t  (error / residual)
-  │                       │
+w1_t ──→ [ Plant P(z) ] ──→ y_t = h(t)⊛w1_t + [T2L] + n_t
+w2_t ─┘                            │
+  │                         ─── (+) ──→ e_t = y_t − a_t  (error / residual)
+  │                        │
   └──→ [ Controller C ] ──→ a_t
         (RL policy π)
 ```
 
 | Symbol | Meaning |
 |--------|---------|
-| `w_t` | Witness signal (reference input, 1 Hz sine + noise) |
-| `f(w_t, t)` | Time-varying nonlinear coupling: `A(t)·w + B(t)·w² + C(t)·w³` |
+| `w1_t` | Horizontal seismometer (witness signal — broadband coloured noise) |
+| `w2_t` | Vertical seismometer (optional, multi-source mode) |
+| `h(t) ⊛ w1` | Linear FIR coupling with OU-drifting resonance parameters |
+| `T(t)·θ(t)·w1` | Bilinear tilt-to-length (T2L) coupling (optional) |
 | `n_t` | Sensor noise (Gaussian, unpredictable) |
 | `y_t` | Main channel (observed: coupling + noise) |
 | `a_t` | Agent's action — estimated coupling to subtract |
@@ -28,61 +32,76 @@ w_t ──→ [ Plant P(z) ] ──→ y_t = f(w_t, t) + n_t
 
 **Objective:** minimise `E[e_t²]` — drive the residual to the sensor noise floor.
 
+### Seismic coupling model
+
+Unlike polynomial toy models, the coupling here is a **linear time-varying FIR filter** — the physically correct description of seismic coupling in LIGO-like detectors:
+
+```
+y(t) = h(t) ⊛ w(t)  +  n_sensor(t)
+```
+
+- `h(t)` is a resonant FIR filter (damped mass-spring-damper, f_r ≈ 0.2 Hz, Q ≈ 5)
+- Parameters drift via **Ornstein–Uhlenbeck** processes (thermal timescale ~10 min)
+- Ground motion `w(t)` is **broadband coloured noise** (1/f² spectrum, 0.05–1.5 Hz)
+- Sampling rate: **4 Hz** (matching the paper's downsampled data stream)
+
+### Tilt-to-length (T2L) bilinear coupling
+
+With `--tilt-coupling` (requires `--multi-source`), a physically motivated nonlinear term is added:
+
+```
+C_T2L(t) = T(t) · θ_proxy(t) · w1(t)
+```
+
+where `θ_proxy[t] = w2[t] − w2[t−1]` approximates ground tilt from Rayleigh waves and `T(t)` is an OU-drifting alignment gain. This **bilinear product of two channels cannot be cancelled by any linear filter** (LMS/NLMS), giving the RL agent a genuine advantage.
+
 ### Why closed-loop?
 
-The observation fed to the agent is:
-
+The agent observes:
 ```
-obs_t = [ witness[t-W+1 .. t],  residual[t-W .. t-1] ]
-          ↑ reference input       ↑ past error signal (feedback)
+obs_t = [ witness1[t-W+1..t], [witness2[t-W+1..t],]  residual[t-W..t-1] ]
 ```
 
-Feeding back past residuals `e_{t-W..t-1}` closes the loop: the agent can observe whether its previous actions over- or under-corrected and adapt accordingly — analogous to the FxLMS algorithm. Without this, the agent would be purely feedforward and unable to correct for model mismatch or drift.
-
-### Coupling model
-
-The coupling coefficients oscillate slowly with incommensurate periods, making the system continuously time-varying:
-
-```
-A(t) = 2.0 + 1.0·sin(2π t / 30)   # linear term
-B(t) = 0.5 + 0.3·sin(2π t / 47)   # quadratic term
-C(t) = 0.2 + 0.1·sin(2π t / 61)   # cubic term
-```
+Feeding back past residuals closes the loop: the agent can observe whether its previous actions over- or under-corrected and adapt accordingly.
 
 ---
 
 ## Repository Structure
 
 ```
-ToysRL/
+RL4Seismic/
 ├── noise_removal/
 │   ├── environment.py     # Gymnasium environment (closed-loop formulation)
-│   └── signals.py         # Signal generator: witness, coupling, sensor noise
+│   ├── signals.py         # SeismicConfig + SeismicSignalSimulator
+│   └── policy.py          # Dilated causal convolution feature extractor
 ├── baselines/
-│   ├── lms_filter.py      # FIR LMS adaptive filter (open-loop baseline)
-│   └── iir_filter.py      # IIR adaptive filter (closed-loop baseline)
+│   ├── lms_filter.py      # NLMS adaptive filter baseline
+│   ├── iir_filter.py      # IIR closed-loop adaptive filter baseline
+│   └── lstm_supervised.py # Supervised LSTM baseline (arXiv:2511.19682)
 ├── train.py               # RecurrentPPO training script
+├── train_resume.py        # Resume training from checkpoint
 ├── evaluate.py            # Evaluation and comparison plots
 └── requirements.txt
 ```
 
 ### Key files
 
+**`noise_removal/signals.py`** — `SeismicConfig` + `SeismicSignalSimulator`.
+Generates physically motivated seismic episodes: resonant FIR coupling, OU-drifting parameters, broadband ground motion, optional multi-source and T2L.
+
 **`noise_removal/environment.py`** — Gymnasium-compatible environment.
-- Observation: `Box(2·W,)` — witness window + residual window
+- Observation: `Box((n_witnesses+1)·W,)` — witness window(s) + residual window
 - Action: `Box(1,)` in `[-15, +15]` — scalar coupling estimate
-- Reward: `y_t² − e_t²` — improvement in instantaneous squared amplitude. Maximised in expectation when `a_t = f(w_t, t)` (exact coupling subtraction).
+- Reward: `y_t² − e_t²` — improvement in instantaneous squared amplitude
 
-**`baselines/lms_filter.py`** — Standard Widrow-Hoff LMS filter. Adapts online using only the witness signal (feedforward, no error feedback).
+**`noise_removal/policy.py`** — `DilatedCausalConvExtractor`.
+WaveNet-style dilated causal convolution feature extractor (alternative to LSTM). Receptive field = 127 samples with 6 layers.
 
-**`baselines/iir_filter.py`** — Equation-error IIR LMS filter. Uses both the witness (feedforward) and past residuals (feedback), mirroring the RL observation structure exactly:
-```
-â_t = b^T · witness[t-M..t]  +  a^T · residual[t-N..t-1]
-```
+**`baselines/lms_filter.py`** — Normalised LMS (NLMS) adaptive filter. Required for coloured seismic inputs (large eigenvalue spread makes plain LMS diverge).
 
-**`train.py`** — Trains a `RecurrentPPO` agent with `MlpLstmPolicy`. The LSTM hidden state allows the agent to adapt its behaviour within an episode, acting like an online adaptive filter rather than a fixed open-loop mapping.
+**`baselines/iir_filter.py`** — Equation-error IIR filter using both witness (feedforward) and past residuals (feedback), mirroring the RL observation exactly.
 
-**`evaluate.py`** — Runs all methods on the same held-out episode and produces comparison plots.
+**`baselines/lstm_supervised.py`** — Offline-trained 3-layer LSTM (hidden 128), MSE loss. Mirrors the supervised approach of arXiv:2511.19682.
 
 ---
 
@@ -92,7 +111,7 @@ ToysRL/
 pip install -r requirements.txt
 ```
 
-**Dependencies:** `gymnasium`, `stable-baselines3`, `sb3-contrib` (for RecurrentPPO), `numpy`, `matplotlib`, `scipy`.
+**Dependencies:** `gymnasium`, `stable-baselines3`, `sb3-contrib` (RecurrentPPO), `numpy`, `matplotlib`, `scipy`, `torch` (for supervised LSTM).
 
 ---
 
@@ -101,48 +120,87 @@ pip install -r requirements.txt
 ### Train
 
 ```bash
-python train.py                          # 2M steps, default settings
-python train.py --timesteps 5_000_000   # longer run
-python train.py --save-path models/my_model
+# Default: single-source, OU-drifting FIR coupling, RecurrentPPO
+python train.py
+
+# Multi-source (two seismometers)
+python train.py --multi-source
+
+# Multi-source + tilt-to-length bilinear coupling
+python train.py --multi-source --tilt-coupling
+
+# Regime changes (sudden coupling path switches)
+python train.py --regime-changes
+
+# Longer run
+python train.py --timesteps 5_000_000
+
+# Dilated causal convolution policy instead of LSTM
+python train.py --dilated-conv --conv-layers 6 --conv-channels 64
 ```
 
 Saves model to `models/ppo_noise_cancellation.zip` and VecNormalize stats to `models/ppo_noise_cancellation_vecnorm.pkl`.
 
+### Resume training
+
+```bash
+python train_resume.py --checkpoint models/ppo_noise_cancellation_100000_steps --extra-steps 500_000
+```
+
 ### Evaluate
 
 ```bash
-python evaluate.py                   # compare all methods
-python evaluate.py --no-model        # baselines only (no RL model needed)
-python evaluate.py --duration 120    # longer evaluation episode
+# Compare all methods (NLMS, IIR, supervised LSTM, RL)
+python evaluate.py
+
+# Fast: baselines only (no model, no LSTM training)
+python evaluate.py --no-model --no-lstm
+
+# With multi-source + T2L (must match training config)
+python evaluate.py --multi-source --tilt-coupling
+
+# Longer episode
+python evaluate.py --duration 600
 ```
 
 Saves plots to `results/noise_cancellation_overview.png`.
 
 ---
 
+## Problem Variants
+
+| Flag | Coupling model | Linear filter floor |
+|------|---------------|---------------------|
+| *(default)* | `h(t) ⊛ w1` — OU-drifting resonant FIR | ~1–2× oracle |
+| `--multi-source` | `h1(t)⊛w1 + h2(t)⊛w2` — two independent FIR | ~1–2× oracle |
+| `--multi-source --tilt-coupling` | above + `T(t)·θ(t)·w1` bilinear | `sqrt(rms(T2L)²+oracle²)` |
+| `--regime-changes` | `h_k ⊛ w` — Poisson coupling path switches | ~2–5× oracle at switch |
+
+The T2L variant provides the most compelling RL advantage: any linear filter is provably bounded away from oracle, but an RL agent that learns the bilinear product can approach it.
+
+---
+
 ## Results
 
-Performance measured as RMS of the output signal, normalised to the oracle (sensor noise floor — the best achievable by any causal filter).
+Performance measured as RMS of the output signal normalised to the oracle (sensor noise floor).
 
-| Method | RMS | vs Oracle |
-|--------|-----|-----------|
-| Raw main channel | 1.68 | 5.6× |
-| LMS filter (FIR) | 0.54 | 1.8× |
-| IIR adaptive filter | 0.45 | 1.5× |
-| RL agent (RecurrentPPO) | TBD | TBD |
-| **Oracle** (sensor noise floor) | 0.30 | **1.0×** |
+| Method | vs Oracle | Notes |
+|--------|-----------|-------|
+| Raw main channel | ~40× | before subtraction |
+| NLMS filter | ~2–4× | linear, stable for coloured noise |
+| IIR adaptive filter | ~2–4× | adds residual feedback |
+| Supervised LSTM (arXiv:2511.19682) | ~1.5–3× | offline-trained |
+| RL agent (RecurrentPPO) | TBD | online adaptive |
+| **Oracle** | **1×** | sensor noise floor only |
 
-The **oracle** subtracts the exact coupling `f(w_t, t)` at every step, leaving only unpredictable sensor noise `n_t`. It is not achievable in practice but defines the performance ceiling.
-
-The IIR filter outperforms LMS by exploiting residual feedback — the same closed-loop structure used by the RL agent. The RecurrentPPO agent (LSTM policy) is designed to close the remaining gap by learning a nonlinear adaptive strategy that classical linear filters cannot represent.
+With `--tilt-coupling`, linear methods are bounded by `sqrt(rms(T2L)² + oracle²)` while the RL agent can in principle reach oracle.
 
 ---
 
 ## Why RL?
 
-Classical adaptive filters (LMS, IIR) are well-suited to smooth, slowly-varying polynomial couplings. RL with a recurrent policy becomes advantageous when:
+Classical adaptive filters (NLMS, IIR) are well-suited to linear, slowly-varying couplings. The RL agent becomes advantageous when:
 
-1. **Sudden regime changes** — coupling jumps discontinuously between modes; the LSTM can detect the transition and re-adapt faster than gradient descent.
-2. **High-order nonlinearity** — couplings beyond cubic that require many filter taps to approximate linearly.
-3. **Multi-source coupling with cross-terms** — e.g. `f(w1, w2) = w1·w2`, which is not separable by additive adaptive filters.
-4. **Hysteresis / state-dependent coupling** — coupling that depends on signal direction or recent history, which the LSTM hidden state can encode.
+1. **Tilt-to-length nonlinearity** — the bilinear T2L term `T(t)·θ(t)·w1(t)` cannot be represented by any linear filter; the LSTM can learn the product implicitly.
+2. **Sudden regime changes** — coupling jumps discontinuously; the LSTM detects the transition from the residual spike and re-adapts faster than gradient descent.
+3. **Long-context adaptation** — the 60 s FIR filter length and slow OU drift reward agents that maintain accurate internal models over minutes.
