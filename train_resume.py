@@ -17,8 +17,7 @@ import re
 
 from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.callbacks import CheckpointCallback
-from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.vec_env import VecNormalize
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 from noise_removal import NoiseCancellationEnv, SignalConfig, SeismicConfig
 
@@ -86,9 +85,10 @@ def main():
     print(f"VecNormalize  : {vecnorm_path}")
     print(f"Extra steps   : {args.extra_steps:,}")
 
-    # Rebuild environment, load VecNormalize statistics
-    vec_env = make_vec_env(make_env(config, args.window_size, args.episode_duration),
-                           n_envs=args.n_envs)
+    # Rebuild environment using DummyVecEnv (avoids subprocess-fork hangs)
+    env_fns = [make_env(config, args.window_size, args.episode_duration)
+               for _ in range(args.n_envs)]
+    vec_env = DummyVecEnv(env_fns)
     vec_env = VecNormalize.load(vecnorm_path, vec_env)
     vec_env.training = True
 
