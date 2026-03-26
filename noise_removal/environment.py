@@ -1,9 +1,9 @@
 """
-Gymnasium environment for online noise cancellation (closed-loop formulation).
+Gymnasium environment for online seismic noise cancellation (closed-loop formulation).
 
 Closed-loop block diagram:
 
-    w1_t ──→ [ Plant P(z) ] ──→ y_t = f(w1_t, [w2_t], t) + n_t
+    w1_t ──→ [ Plant P(z) ] ──→ y_t = h(t)⊛w1_t + [T2L] + n_t
     w2_t ─┘                            │
       │                         ─── (+) ──→ e_t = y_t − a_t  (error / residual)
       │                        │
@@ -17,8 +17,8 @@ Multi-source observation (config.multi_source=True, 3·W floats):
     [ witness1[t-W+1..t],  witness2[t-W+1..t],  residual[t-W..t-1] ]
 
 The second witness window gives the agent the information needed to learn
-the cross-term E(t)·w1·w2, which adaptive filters cannot represent without
-an explicit product feature.
+the tilt-to-length bilinear cross-coupling T(t)·θ(t)·w1(t), which linear
+adaptive filters (LMS/NLMS) cannot cancel.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ import gymnasium as gym
 from gymnasium import spaces
 from scipy.signal import butter, sosfilt_zi, sosfilt
 
-from .signals import SignalConfig, SignalSimulator, SeismicConfig, SeismicSignalSimulator
+from .signals import SeismicConfig, SeismicSignalSimulator
 
 
 class NoiseCancellationEnv(gym.Env):
@@ -62,16 +62,16 @@ class NoiseCancellationEnv(gym.Env):
 
     def __init__(
         self,
-        config: Optional[SignalConfig] = None,
-        window_size: int = 64,
-        episode_duration: float = 30.0,
+        config: Optional[SeismicConfig] = None,
+        window_size: int = 240,
+        episode_duration: float = 300.0,
         action_clip: float = 15.0,
         freq_reward: bool = False,
-        freq_band_low: float = 0.1,
-        freq_band_high: float = 15.0,
+        freq_band_low: float = 0.05,
+        freq_band_high: float = 1.5,
     ):
         super().__init__()
-        self.config = config if config is not None else SignalConfig()
+        self.config = config if config is not None else SeismicConfig()
         self.window_size = window_size
         self.episode_duration = episode_duration
         self.action_clip = action_clip
@@ -112,10 +112,7 @@ class NoiseCancellationEnv(gym.Env):
     def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
         super().reset(seed=seed)
 
-        if isinstance(self.config, SeismicConfig):
-            sim = SeismicSignalSimulator(self.config, seed=seed)
-        else:
-            sim = SignalSimulator(self.config, seed=seed)
+        sim = SeismicSignalSimulator(self.config, seed=seed)
         self._data = sim.generate_episode(
             duration=self.episode_duration,
             signal_amplitude=0.0,
