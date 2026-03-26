@@ -367,7 +367,18 @@ def main():
     rl_clean = None
     if not args.no_model:
         model_zip = args.model_path + ".zip"
-        vecnorm   = args.model_path + "_vecnorm.pkl"
+        # Support both final save (_vecnorm.pkl) and checkpoint naming
+        # (_vecnormalize_{steps}_steps.pkl)
+        import re as _re
+        vecnorm = args.model_path + "_vecnorm.pkl"
+        if not os.path.exists(vecnorm):
+            m = _re.search(r"_(\d+)_steps$", args.model_path)
+            if m:
+                steps = m.group(1)
+                prefix = args.model_path[: args.model_path.rindex(f"_{steps}_steps")]
+                candidate = f"{prefix}_vecnormalize_{steps}_steps.pkl"
+                if os.path.exists(candidate):
+                    vecnorm = candidate
         if os.path.exists(model_zip) and os.path.exists(vecnorm):
             from sb3_contrib import RecurrentPPO
             model = RecurrentPPO.load(model_zip)
