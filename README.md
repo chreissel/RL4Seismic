@@ -2,7 +2,7 @@
 
 A reinforcement learning environment for active seismic noise cancellation, formulated as a **closed-loop control problem**. A PPO agent with an LSTM policy learns to track and subtract a physically motivated seismic coupling signal from a noisy main channel — benchmarked against classical adaptive filters (NLMS, IIR) and a supervised LSTM baseline.
 
-Inspired by and aligned with [arXiv:2511.19682](https://arxiv.org/abs/2511.19682) (Reissel et al., 2025).
+Inspired by [arXiv:2511.19682](https://arxiv.org/abs/2511.19682) (Reissel et al., 2025), which applies supervised LSTMs to real LIGO data. This repository uses a synthetic simulator that matches the paper's signal processing parameters (4 Hz, 60 s context window, microseismic band) but models non-stationarity with an Ornstein–Uhlenbeck process — our own approximation, not from the paper.
 
 ---
 
@@ -41,9 +41,9 @@ y(t) = h(t) ⊛ w(t)  +  n_sensor(t)
 ```
 
 - `h(t)` is a resonant FIR filter (damped mass-spring-damper, f_r ≈ 0.2 Hz, Q ≈ 5)
-- Parameters drift via **Ornstein–Uhlenbeck** processes (thermal timescale ~10 min)
+- Parameters drift via **Ornstein–Uhlenbeck** processes — a synthetic approximation of slow thermal/alignment drift (timescale ~10 min). Real LIGO coupling is non-stationary across many timescales: minutes–hours (thermal), months (seasonal ocean storms), and sudden discontinuities (lock-loss, maintenance). The OU model captures only the slow mean-reverting component.
 - Ground motion `w(t)` is **broadband coloured noise** (1/f² spectrum, 0.05–1.5 Hz)
-- Sampling rate: **4 Hz** (matching the paper's downsampled data stream)
+- Sampling rate: **4 Hz**, context window: **60 s** — matching arXiv:2511.19682
 
 ### Tilt-to-length (T2L) bilinear coupling
 
