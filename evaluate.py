@@ -270,13 +270,18 @@ def parse_args():
     p.add_argument("--save-dir", default="results")
     p.add_argument("--multi-source", action="store_true",
                    help="Evaluate on multi-source coupling with cross-term w1·w2")
+    p.add_argument("--regime-changes", action="store_true",
+                   help="Evaluate on piecewise-constant coupling with sudden regime switches")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
 
-    cfg = SignalConfig(multi_source=args.multi_source)
+    cfg = SignalConfig(
+        multi_source=args.multi_source,
+        regime_changes=args.regime_changes,
+    )
     sim = SignalSimulator(cfg, seed=args.seed)
     data = sim.generate_episode(duration=args.duration, signal_amplitude=0.0)
 

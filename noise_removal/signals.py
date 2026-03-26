@@ -21,17 +21,24 @@ Coupling models
 ---------------
 Single-source (default):
   f(w1, t) = A(t)·w1  +  B(t)·w1²  +  C(t)·w1³
+  Coefficients drift smoothly with incommensurate periods (30/47/61 s).
 
 Multi-source (--multi-source flag):
   f(w1, w2, t) = A(t)·w1  +  B(t)·w1²  +  C(t)·w1³   (polynomial on w1)
                + D(t)·w2                                (linear on w2)
                + E(t)·w1·w2                             (cross-term — not
                                                           separable!)
+  The cross-term E(t)·w1·w2 cannot be represented as a linear combination
+  of w1 and w2 alone.
 
-The cross-term E(t)·w1·w2 cannot be represented as a linear combination
-of w1 and w2 alone, so LMS/IIR filters using both channels as separate
-inputs will still have a systematic residual.  A recurrent RL agent that
-sees both witness windows can learn the product implicitly.
+Regime-change (--regime-changes flag):
+  Same polynomial structure as single-source, but coefficients are
+  piecewise-constant: they jump instantaneously between K pre-sampled
+  discrete modes at Poisson-distributed switch times (mean hold ~8 s).
+  Adaptive filters (LMS/IIR) need O(100) samples to re-converge after
+  each jump.  A recurrent RL agent trained on many switches can learn to
+  detect the residual spike, identify the new regime, and recover in far
+  fewer steps.
 """
 
 from __future__ import annotations
@@ -71,6 +78,12 @@ class SignalConfig:
 
     # --- problem variant ---
     multi_source: bool = False      # enable second witness + cross-term coupling
+    regime_changes: bool = False    # piecewise-constant coupling with sudden jumps
+    n_regimes: int = 4              # number of discrete coupling modes
+    mean_hold_time: float = 3.0     # average seconds per regime (Poisson).
+                                    # Filter convergence time ≈ 1/(2μ·power) ≈ 8 s,
+                                    # so hold << 8 s keeps the filter always mid-
+                                    # convergence, exposing the switch-recovery gap.
 
 
 # ---------------------------------------------------------------------------
@@ -130,14 +143,22 @@ class MultiSourceCoupling:
     Extra coefficient ranges
     ------------------------
     D(t) ∈ [0.7, 2.3]   (linear term on w2, period 37 s)
-    E(t) ∈ [0.4, 1.2]   (cross-term w1·w2,  period 53 s)
+    E(t) ∈ [1.5, 4.5]   (cross-term w1·w2,  period 53 s)
+
+    The cross-term is sized so that it accounts for ~60 % of the total
+    coupling RMS, giving adaptive filters an irreducible residual floor
+    of ~4–5× oracle (vs 1–2× oracle for single-source).  The RL agent,
+    which sees both witness windows, can learn the product implicitly
+    and in principle approach oracle.
     """
 
     def __init__(self, config: SignalConfig):
         self._single = TimeVaryingCoupling(config)
-        # Cross-source coefficients with incommensurate periods
+        # Cross-source coefficients with incommensurate periods.
+        # E offset raised from 0.8 → 3.0 so the cross-term dominates
+        # and creates an irreducible floor for linear baselines.
         self._d_params = (1.5, 0.8, 37.0, np.pi / 7)   # D(t): w2
-        self._e_params = (0.8, 0.4, 53.0, np.pi / 4)   # E(t): w1·w2
+        self._e_params = (3.0, 1.5, 53.0, np.pi / 4)   # E(t): w1·w2  (dominant)
 
     def _coeff(self, params, t):
         offset, amp, period, phase = params
@@ -152,6 +173,79 @@ class MultiSourceCoupling:
         D  = self._coeff(self._d_params, t)
         E  = self._coeff(self._e_params, t)
         return self._single(w1, t) + D * w2 + E * w1 * w2
+
+
+class RegimeChangeCoupling:
+    """
+    Piecewise-constant coupling: f(w, t) = A_k·w + B_k·w² + C_k·w³
+
+    At episode start, K regimes are sampled uniformly:
+        A_k ~ U[1.0, 3.0],  B_k ~ U[0.2, 0.8],  C_k ~ U[0.1, 0.3]
+
+    The active regime switches on a Poisson process (exponentially distributed
+    hold times with mean = config.mean_hold_time seconds).  Each switch picks
+    a new regime uniformly from all K, including the current one.
+
+    Impact on adaptive filters
+    --------------------------
+    LMS and IIR filters maintain a weight vector that tracks the current
+    regime.  After a sudden jump the weights are mismatched and the residual
+    spikes; convergence back to near-oracle takes O(1 / (μ · signal_power))
+    samples — typically 100-500 steps at default step sizes.
+
+    A recurrent RL agent trained across many episodes with random switch
+    times can learn to detect the residual spike pattern and immediately
+    output an action close to the new regime's coupling, recovering in
+    O(window_size) steps.
+    """
+
+    def __init__(self, config: SignalConfig):
+        self.config = config
+
+    def make_schedule(self, n: int, rng: np.random.Generator) -> np.ndarray:
+        """
+        Sample K regime coefficient sets and a per-sample regime index.
+
+        Returns
+        -------
+        schedule : (n,) int array  — index into self.A/B/C for each sample
+        Also sets self.A, self.B, self.C as (K,) arrays for this episode.
+        """
+        K = self.config.n_regimes
+        fs = self.config.fs
+        mean_hold = self.config.mean_hold_time
+
+        # Sample K distinct coupling regimes
+        self.A = rng.uniform(1.0, 3.0, K)
+        self.B = rng.uniform(0.2, 0.8, K)
+        self.C = rng.uniform(0.1, 0.3, K)
+
+        # Build schedule via Poisson-distributed hold times
+        schedule = np.empty(n, dtype=np.int32)
+        pos = 0
+        regime = int(rng.integers(0, K))
+        while pos < n:
+            hold = max(1, int(rng.exponential(mean_hold * fs)))
+            end = min(pos + hold, n)
+            schedule[pos:end] = regime
+            pos = end
+            regime = int(rng.integers(0, K))
+        return schedule
+
+    def __call__(self, witness: np.ndarray, schedule: np.ndarray) -> np.ndarray:
+        """
+        Evaluate coupling given a pre-generated regime schedule.
+
+        Parameters
+        ----------
+        witness  : (N,) witness channel
+        schedule : (N,) int array from make_schedule()
+        """
+        w = np.asarray(witness, dtype=float)
+        A = self.A[schedule]
+        B = self.B[schedule]
+        C = self.C[schedule]
+        return A * w + B * w**2 + C * w**3
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +265,7 @@ class SignalSimulator:
     dict_keys(['time', 'witness', 'main', 'coupling', 'sensor_noise', 'true_signal'])
 
     With multi_source=True in config, the returned dict also contains 'witness2'.
+    With regime_changes=True, the returned dict also contains 'regime' (int array).
     """
 
     def __init__(self, config: SignalConfig, seed: Optional[int] = None):
@@ -178,6 +273,8 @@ class SignalSimulator:
         self.rng = np.random.default_rng(seed)
         if config.multi_source:
             self.coupling = MultiSourceCoupling(config)
+        elif config.regime_changes:
+            self.coupling = RegimeChangeCoupling(config)
         else:
             self.coupling = TimeVaryingCoupling(config)
 
@@ -200,6 +297,7 @@ class SignalSimulator:
           'coupling'     : (N,) true coupling f(w1, [w2], t)
           'sensor_noise' : (N,) Gaussian sensor noise
           'true_signal'  : (N,) injected test signal (zeros during training)
+          'regime'       : (N,) int regime index  [regime-changes only]
         """
         cfg = self.config
         n = int(duration * cfg.fs)
@@ -218,14 +316,19 @@ class SignalSimulator:
             else np.zeros(n)
         )
 
+        witness2 = None
+        regime = None
+
         if cfg.multi_source:
             witness2 = (
                 cfg.w2_amplitude * np.sin(2 * np.pi * cfg.w2_freq * t)
                 + self.rng.normal(0.0, cfg.w2_noise_sigma, n)
             )
             coupling = self.coupling(witness, witness2, t)
+        elif cfg.regime_changes:
+            regime = self.coupling.make_schedule(n, self.rng)
+            coupling = self.coupling(witness, regime)
         else:
-            witness2 = None
             coupling = self.coupling(witness, t)
 
         main = true_signal + sensor_noise + coupling
@@ -240,4 +343,6 @@ class SignalSimulator:
         }
         if witness2 is not None:
             result["witness2"] = witness2
+        if regime is not None:
+            result["regime"] = regime
         return result

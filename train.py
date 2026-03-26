@@ -47,6 +47,9 @@ def parse_args():
     p.add_argument("--multi-source", action="store_true",
                    help="Enable second witness channel with cross-term coupling "
                         "(harder for linear adaptive filters)")
+    p.add_argument("--regime-changes", action="store_true",
+                   help="Enable sudden coupling regime switches (Poisson process); "
+                        "adaptive filters must re-converge after each jump")
     return p.parse_args()
 
 
@@ -65,7 +68,10 @@ def main():
     os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
     os.makedirs(args.log_dir, exist_ok=True)
 
-    config = SignalConfig(multi_source=args.multi_source)
+    config = SignalConfig(
+        multi_source=args.multi_source,
+        regime_changes=args.regime_changes,
+    )
 
     print("=" * 60)
     print("  RL Noise Cancellation — RecurrentPPO Training")
@@ -75,6 +81,9 @@ def main():
     print(f"  Sensor noise σ : {config.sensor_noise_sigma}")
     if config.multi_source:
         print(f"  Coupling model : A·w1 + B·w1² + C·w1³ + D·w2 + E·w1·w2  (multi-source)")
+    elif config.regime_changes:
+        print(f"  Coupling model : A_k·w + B_k·w² + C_k·w³  ({config.n_regimes} regimes, "
+              f"mean hold {config.mean_hold_time:.0f} s)")
     else:
         print(f"  Coupling model : A(t)·w + B(t)·w² + C(t)·w³  (single-source)")
     print(f"  Window size    : {args.window_size} samples"
