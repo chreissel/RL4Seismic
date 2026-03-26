@@ -37,10 +37,12 @@ def parse_args():
                    help="Total training timesteps (default: 2 000 000)")
     p.add_argument("--n-envs", type=int, default=4,
                    help="Number of parallel training environments (default: 4)")
-    p.add_argument("--window-size", type=int, default=64,
-                   help="Observation window in samples (default: 64 = 0.5 s)")
-    p.add_argument("--episode-duration", type=float, default=30.0,
-                   help="Episode length in seconds (default: 30)")
+    p.add_argument("--window-size", type=int, default=None,
+                   help="Observation window in samples "
+                        "(default: 240 for seismic = 60 s @ 4 Hz, 64 otherwise)")
+    p.add_argument("--episode-duration", type=float, default=None,
+                   help="Episode length in seconds "
+                        "(default: 300 for seismic, 30 otherwise)")
     p.add_argument("--save-path", type=str, default="models/ppo_noise_cancellation",
                    help="Path to save the trained model (without .zip)")
     p.add_argument("--log-dir", type=str, default="logs/ppo_noise_cancellation",
@@ -87,6 +89,14 @@ def main():
             regime_changes=args.regime_changes,
         )
 
+    # Seismic-aware defaults: 4 Hz sampling needs a larger window and longer episodes
+    window_size      = args.window_size      if args.window_size      is not None else (
+        config.filter_length if args.seismic else 64
+    )
+    episode_duration = args.episode_duration if args.episode_duration is not None else (
+        300.0 if args.seismic else 30.0
+    )
+
     print("=" * 60)
     print("  RL Noise Cancellation — RecurrentPPO Training")
     print("=" * 60)
@@ -108,16 +118,16 @@ def main():
               f"mean hold {config.mean_hold_time:.0f} s)")
     else:
         print(f"  Coupling model : A(t)·w + B(t)·w² + C(t)·w³  (single-source)")
-    print(f"  Window size    : {args.window_size} samples"
-          f" = {args.window_size/config.fs:.3f} s")
-    print(f"  Episode length : {args.episode_duration} s")
+    print(f"  Window size    : {window_size} samples"
+          f" = {window_size/config.fs:.3f} s")
+    print(f"  Episode length : {episode_duration} s")
     print(f"  Total steps    : {args.timesteps:,}")
     print(f"  Parallel envs  : {args.n_envs}")
     print("=" * 60)
 
     # Vectorised environment with observation normalisation
     vec_env = make_vec_env(
-        make_env(config, args.window_size, args.episode_duration),
+        make_env(config, window_size, episode_duration),
         n_envs=args.n_envs,
     )
     vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_obs=10.0)

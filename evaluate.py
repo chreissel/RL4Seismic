@@ -36,7 +36,7 @@ from scipy.signal import welch
 
 from noise_removal import NoiseCancellationEnv, SignalConfig, SignalSimulator
 from noise_removal import SeismicConfig, SeismicSignalSimulator
-from baselines import LMSFilter, IIRFilter
+from baselines import LMSFilter, IIRFilter, SupervisedLSTM
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +73,42 @@ def run_iir(
     )
     w2 = data.get("witness2")
     return filt.run(data["witness"], data["main"], witness2=w2)
+
+
+def run_supervised_lstm(
+    train_data: dict,
+    eval_data: dict,
+    window_size: int = 240,
+    hidden_size: int = 128,
+    n_layers: int = 3,
+    n_epochs: int = 30,
+    verbose: bool = False,
+) -> np.ndarray:
+    """
+    Train a supervised LSTM on train_data and evaluate on eval_data.
+
+    Mirrors arXiv:2511.19682: causal 3-layer LSTM (hidden 128), MSE loss,
+    trained offline on a separate episode, then run causally on the eval
+    episode.
+
+    Parameters
+    ----------
+    train_data  : episode dict used for offline training
+    eval_data   : episode dict to evaluate (same config, different seed)
+    window_size : context window in samples (240 = 60 s @ 4 Hz)
+    """
+    lstm = SupervisedLSTM(
+        window_size=window_size,
+        hidden_size=hidden_size,
+        n_layers=n_layers,
+        n_epochs=n_epochs,
+    )
+    if verbose:
+        print(f"  Training supervised LSTM ({n_epochs} epochs)…")
+    lstm.fit(train_data, verbose=verbose)
+
+    w2 = eval_data.get("witness2")
+    return lstm.run(eval_data["witness"], eval_data["main"], witness2=w2)
 
 
 def run_rl_agent(
@@ -158,6 +194,7 @@ def plot_overview(
     save_dir: str,
     fs: float = 128.0,
     seismic: bool = False,
+    lstm_clean: Optional[np.ndarray] = None,
 ):
     t = data["time"]
     oracle_clean = data["sensor_noise"]  # best possible: coupling perfectly removed
@@ -195,6 +232,8 @@ def plot_overview(
     ax1.plot(t[mask], data["main"][mask], alpha=0.6, lw=0.8, label="Raw", color="grey")
     ax1.plot(t[mask], lms_clean[mask], alpha=0.8, lw=0.9, label="LMS", color="tab:orange")
     ax1.plot(t[mask], iir_clean[mask], alpha=0.8, lw=0.9, label="IIR", color="tab:purple")
+    if lstm_clean is not None:
+        ax1.plot(t[mask], lstm_clean[mask], alpha=0.9, lw=0.9, label="LSTM (supervised)", color="tab:green")
     if rl_clean is not None:
         ax1.plot(t[mask], rl_clean[mask], alpha=0.9, lw=0.9, label="RL (PPO)", color="tab:blue")
     ax1.plot(t[mask], oracle_clean[mask], "--", lw=0.8, label="Oracle", color="tab:red", alpha=0.7)
@@ -206,7 +245,7 @@ def plot_overview(
 
     # ---- PSD comparison ----
     ax2 = fig.add_subplot(gs[1, 1])
-    nperseg = 512
+    nperseg = min(512, len(data["main"]))
     for sig, label, color, lw in [
         (data["main"], "Raw",    "grey",       1.0),
         (lms_clean,    "LMS",    "tab:orange", 1.2),
@@ -215,6 +254,9 @@ def plot_overview(
     ]:
         f_psd, pxx = welch(sig, fs=fs, nperseg=nperseg)
         ax2.semilogy(f_psd, pxx, label=label, color=color, lw=lw, alpha=0.8)
+    if lstm_clean is not None:
+        f_psd, pxx = welch(lstm_clean, fs=fs, nperseg=nperseg)
+        ax2.semilogy(f_psd, pxx, label="LSTM (supervised)", color="tab:green", lw=1.2)
     if rl_clean is not None:
         f_psd, pxx = welch(rl_clean, fs=fs, nperseg=nperseg)
         ax2.semilogy(f_psd, pxx, label="RL (PPO)", color="tab:blue", lw=1.3)
@@ -235,6 +277,8 @@ def plot_overview(
     ax3.plot(t, rolling_rms(data["main"]), lw=0.8, label="Raw", color="grey", alpha=0.7)
     ax3.plot(t, rolling_rms(lms_clean), lw=0.9, label="LMS", color="tab:orange")
     ax3.plot(t, rolling_rms(iir_clean), lw=0.9, label="IIR", color="tab:purple")
+    if lstm_clean is not None:
+        ax3.plot(t, rolling_rms(lstm_clean), lw=0.9, label="LSTM (supervised)", color="tab:green")
     if rl_clean is not None:
         ax3.plot(t, rolling_rms(rl_clean), lw=0.9, label="RL (PPO)", color="tab:blue")
     ax3.axhline(rms(oracle_clean), ls="--", color="tab:red", lw=0.9, label="Oracle RMS")
@@ -249,10 +293,14 @@ def plot_overview(
     labels = ["Raw", "LMS", "IIR", "Oracle"]
     values = [rms(data["main"]), rms(lms_clean), rms(iir_clean), rms(oracle_clean)]
     colors = ["grey", "tab:orange", "tab:purple", "tab:red"]
+    if lstm_clean is not None:
+        labels.insert(3, "LSTM")
+        values.insert(3, rms(lstm_clean))
+        colors.insert(3, "tab:green")
     if rl_clean is not None:
-        labels.insert(3, "RL (PPO)")
-        values.insert(3, rms(rl_clean))
-        colors.insert(3, "tab:blue")
+        labels.insert(-1, "RL (PPO)")
+        values.insert(-1, rms(rl_clean))
+        colors.insert(-1, "tab:blue")
     bars = ax4.bar(labels, values, color=colors, alpha=0.8, edgecolor="black", lw=0.7)
     ax4.set_ylabel("RMS amplitude")
     ax4.set_title("Overall RMS comparison")
@@ -268,7 +316,7 @@ def plot_overview(
     plt.close(fig)
 
 
-def print_metrics(data, lms_clean, iir_clean, rl_clean):
+def print_metrics(data, lms_clean, iir_clean, rl_clean, lstm_clean=None):
     oracle_rms = rms(data["sensor_noise"])
     raw_rms    = rms(data["main"])
     lms_rms    = rms(lms_clean)
@@ -288,6 +336,9 @@ def print_metrics(data, lms_clean, iir_clean, rl_clean):
     print(f"  Raw main channel              : {raw_rms:.4f}  ({raw_rms/oracle_rms:.1f}× oracle)")
     print(f"  NLMS filter                   : {lms_rms:.4f}  ({lms_rms/oracle_rms:.1f}× oracle)")
     print(f"  IIR adaptive filter           : {iir_rms:.4f}  ({iir_rms/oracle_rms:.1f}× oracle)")
+    if lstm_clean is not None:
+        lstm_rms = rms(lstm_clean)
+        print(f"  Supervised LSTM               : {lstm_rms:.4f}  ({lstm_rms/oracle_rms:.1f}× oracle)")
     if rl_clean is not None:
         rl_rms = rms(rl_clean)
         beats = " *** BEATS LINEAR FLOOR ***" if "coupling_t2l" in data and rl_rms < float(np.sqrt(rms(data["coupling_t2l"])**2 + oracle_rms**2)) else ""
@@ -304,9 +355,13 @@ def parse_args():
     p.add_argument("--model-path", default="models/ppo_noise_cancellation")
     p.add_argument("--no-model", action="store_true",
                    help="Skip RL evaluation (compare LMS vs oracle only)")
-    p.add_argument("--window-size", type=int, default=64)
-    p.add_argument("--duration", type=float, default=60.0,
-                   help="Evaluation episode duration in seconds (default: 60)")
+    p.add_argument("--window-size", type=int, default=None,
+                   help="Context window in samples (default: 240 for seismic, 64 otherwise)")
+    p.add_argument("--duration", type=float, default=None,
+                   help="Eval episode duration in seconds (default: 300 for seismic, 60 otherwise)")
+    p.add_argument("--train-duration", type=float, default=None,
+                   help="Training episode duration for supervised LSTM "
+                        "(default: 3× eval duration)")
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--save-dir", default="results")
     p.add_argument("--multi-source", action="store_true",
@@ -319,6 +374,10 @@ def parse_args():
                    help="Add bilinear tilt-to-length cross-coupling "
                         "(seismic + multi-source only): C_T2L = T(t)·θ(t)·w1(t); "
                         "creates an irreducible floor for all linear baselines")
+    p.add_argument("--no-lstm", action="store_true",
+                   help="Skip supervised LSTM baseline (faster evaluation)")
+    p.add_argument("--lstm-epochs", type=int, default=30,
+                   help="Training epochs for the supervised LSTM (default: 30)")
     return p.parse_args()
 
 
@@ -331,22 +390,39 @@ def main():
             regime_changes=args.regime_changes,
             tilt_coupling=args.tilt_coupling,
         )
-        sim = SeismicSignalSimulator(cfg, seed=args.seed)
+        sim_cls = SeismicSignalSimulator
     else:
         cfg = SignalConfig(
             multi_source=args.multi_source,
             regime_changes=args.regime_changes,
         )
-        sim = SignalSimulator(cfg, seed=args.seed)
-    data = sim.generate_episode(duration=args.duration, signal_amplitude=0.0)
+        sim_cls = SignalSimulator
 
-    print(f"Generated {args.duration:.0f} s of evaluation data  "
+    # Seismic-aware defaults: 4 Hz sampling needs much longer episodes
+    window_size = args.window_size if args.window_size is not None else (
+        cfg.filter_length if args.seismic else 64
+    )
+    duration = args.duration if args.duration is not None else (
+        300.0 if args.seismic else 60.0
+    )
+    train_duration = args.train_duration if args.train_duration is not None else (
+        duration * 3
+    )
+
+    sim = sim_cls(cfg, seed=args.seed)
+    data = sim.generate_episode(duration=duration, signal_amplitude=0.0)
+
+    print(f"Generated {duration:.0f} s of evaluation data  "
           f"(fs={cfg.fs} Hz, {len(data['time'])} samples)")
 
     # --- LMS baseline ---
     # NLMS is used for the seismic model: coloured 1/f² ground motion creates
     # a large eigenvalue spread that causes plain LMS to diverge.
-    lms_clean = run_lms(data, filter_length=args.window_size, normalized=args.seismic)
+    # For NLMS the step size is dimensionless ∈ (0, 2); 0.1 gives stable,
+    # reasonably fast convergence.  For plain LMS 5e-4 is typical.
+    lms_step = 0.1 if args.seismic else 5e-4
+    lms_clean = run_lms(data, filter_length=window_size, step_size=lms_step,
+                        normalized=args.seismic)
     print("LMS filter done.")
 
     # --- IIR baseline ---
@@ -354,14 +430,31 @@ def main():
     # physics), so the optimal IIR feedback weights are zero.  We set
     # feedback_length=0 to avoid the equation-error instability that arises
     # from a non-zero feedback length on coloured seismic signals.
-    iir_fb = 0 if args.seismic else args.window_size
+    iir_fb = 0 if args.seismic else window_size
     iir_clean = run_iir(
         data,
-        feedforward_length=args.window_size,
+        feedforward_length=window_size,
         feedback_length=iir_fb,
+        step_size=lms_step,
         normalized=args.seismic,
     )
     print("IIR filter done.")
+
+    # --- Supervised LSTM baseline (paper approach) ---
+    lstm_clean = None
+    if not args.no_lstm:
+        print(f"Training supervised LSTM on {train_duration:.0f} s episode "
+              f"(seed={args.seed + 1000})…")
+        train_sim  = sim_cls(cfg, seed=args.seed + 1000)
+        train_data = train_sim.generate_episode(duration=train_duration,
+                                                signal_amplitude=0.0)
+        lstm_clean = run_supervised_lstm(
+            train_data, data,
+            window_size=window_size,
+            n_epochs=args.lstm_epochs,
+            verbose=True,
+        )
+        print("Supervised LSTM done.")
 
     # --- RL agent ---
     rl_clean = None
@@ -383,17 +476,18 @@ def main():
             from sb3_contrib import RecurrentPPO
             model = RecurrentPPO.load(model_zip)
             print(f"Loaded model from {model_zip}")
-            rl_clean = run_rl_agent(data, model, vecnorm, window_size=args.window_size, config=cfg)
+            rl_clean = run_rl_agent(data, model, vecnorm, window_size=window_size, config=cfg)
             print("RL rollout done.")
         else:
             print(f"No model found at {model_zip} — run  python train.py  first.")
             print("Proceeding without RL agent.")
 
-    print_metrics(data, lms_clean, iir_clean, rl_clean)
+    print_metrics(data, lms_clean, iir_clean, rl_clean, lstm_clean=lstm_clean)
     plot_overview(
         data, lms_clean, iir_clean, rl_clean,
         save_dir=args.save_dir, fs=cfg.fs,
         seismic=args.seismic,
+        lstm_clean=lstm_clean,
     )
     print("\nDone. Figures saved to", args.save_dir)
 

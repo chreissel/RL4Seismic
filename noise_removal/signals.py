@@ -411,25 +411,31 @@ class SeismicConfig:
       y(t) = h(t) ⊛ w(t)  +  n_sensor(t)
     where h(t) is a slowly drifting resonant FIR coupling filter and
     w(t) is broadband seismic ground motion.
+
+    Defaults are aligned with arXiv:2511.19682 (Reissel et al., 2025):
+      - 4 Hz sampling rate (matching their downsampled data stream)
+      - 0.1–0.3 Hz microseismic band (ocean-wave-generated noise)
+      - 240-tap FIR = 60 s context (matching their LSTM input window)
+      - Thermal timescale ~10 min (OU drift of mechanical coupling parameters)
     """
 
     # --- sampling ---
-    fs: float = 128.0
+    fs: float = 4.0                     # Hz — matches paper's 4 Hz downsampled rate
 
     # --- seismic ground motion ---
     seismic_amplitude: float = 1.0      # normalised RMS of witness channel
     witness_noise_sigma: float = 0.02   # seismometer self-noise (small)
 
-    # --- coupling filter (resonant mechanical mode) ---
-    filter_length: int = 64             # FIR taps
+    # --- coupling filter (microseismic resonance) ---
+    filter_length: int = 240            # FIR taps = 60 s × 4 Hz (paper context window)
     coupling_gain: float = 2.0          # nominal coupling RMS gain
-    resonance_freq: float = 3.0         # Hz  — isolation system resonance
-    resonance_q: float = 4.0            # quality factor Q = f_r / bandwidth
+    resonance_freq: float = 0.2         # Hz  — microseismic band (0.1–0.3 Hz)
+    resonance_q: float = 5.0            # quality factor Q = f_r / bandwidth
 
     # --- thermal / alignment drift (Ornstein–Uhlenbeck) ---
-    thermal_timescale: float = 300.0    # seconds  (≈ 5 min thermal time const.)
-    gain_drift_sigma: float = 0.5       # OU stationary std of gain fluctuation
-    freq_drift_sigma: float = 0.8       # OU stationary std of freq fluctuation (Hz)
+    thermal_timescale: float = 600.0    # seconds  (≈ 10 min thermal time const.)
+    gain_drift_sigma: float = 0.3       # OU stationary std of gain fluctuation
+    freq_drift_sigma: float = 0.03      # Hz — tight drift around 0.2 Hz resonance
 
     # --- main channel sensor noise ---
     sensor_noise_sigma: float = 0.05    # residual noise after passive isolation
@@ -437,19 +443,22 @@ class SeismicConfig:
     # --- regime changes (sudden coupling path change) ---
     regime_changes: bool = False
     n_regimes: int = 4
-    mean_hold_time: float = 15.0        # seconds — avg hold between switches
+    mean_hold_time: float = 120.0       # seconds — longer holds at 4 Hz
 
-    # --- multi-source (second seismometer at independent location) ---
+    # --- multi-source (second seismometer / rotational DOF) ---
+    # Mirrors the paper's multi-DOF setup where translational and rotational
+    # channels couple nonlinearly (tilt-to-length mechanism).
     multi_source: bool = False
     w2_coupling_gain: float = 1.5
-    w2_resonance_freq: float = 6.0      # Hz  — different resonance
-    w2_resonance_q: float = 3.0
+    w2_resonance_freq: float = 0.35     # Hz  — slightly different resonance
+    w2_resonance_q: float = 4.0
 
     # --- tilt-to-length bilinear cross-coupling (requires multi_source=True) ---
     # Models the Rayleigh-wave tilt-to-length mechanism:
     #   C_T2L(t) = T(t) · [H_tilt ⊛ w2(t)] · w1(t)
     # where H_tilt is a finite-difference approximation of d/dt (tilt proxy)
     # and T(t) is an OU-drifting alignment-dependent coupling gain.
+    # This is the dominant nonlinearity identified in arXiv:2511.19682.
     tilt_coupling: bool = False
     t2l_gain: float = 0.8               # nominal T2L coupling gain
     t2l_gain_drift_sigma: float = 0.2   # OU fluctuation of T2L gain
@@ -526,12 +535,13 @@ def _seismic_ground_motion(
 
     The result is normalised to RMS = amplitude.
     """
-    extra = 512  # discard filter transient
+    extra = min(512, n // 2)  # discard filter transient (scale with episode length)
     white = rng.normal(0.0, 1.0, n + extra)
     brown = np.cumsum(white) / np.sqrt(n + extra)
 
-    f_low  = 0.1 / (fs / 2.0)
-    f_high = min(20.0, fs * 0.45) / (fs / 2.0)
+    # Target microseismic band (0.05–1.5 Hz), clamped to Nyquist
+    f_low  = max(0.02, 0.05) / (fs / 2.0)
+    f_high = min(1.5, fs * 0.45) / (fs / 2.0)
     sos = butter(4, [f_low, f_high], btype="band", output="sos")
     filtered = sosfilt(sos, brown)[extra:]
 
@@ -687,9 +697,9 @@ class SeismicSignalSimulator:
         cfg = self.config
         K, M = cfg.n_regimes, cfg.filter_length
 
-        # Sample K distinct FIR filters
+        # Sample K distinct FIR filters spanning the microseismic band
         gains = self.rng.uniform(0.8, 3.5, K)
-        freqs = self.rng.uniform(1.0, 10.0, K)
+        freqs = self.rng.uniform(0.1, min(0.5, cfg.fs * 0.4), K)
 
         filters = np.stack([
             _make_resonant_fir(gains[k], freqs[k], cfg.resonance_q, M, cfg.fs)
