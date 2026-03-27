@@ -2,27 +2,33 @@
 Dilated causal convolution feature extractor for noise cancellation.
 
 Inspired by the DeepMind Deep Loop Shaping work (arXiv:2509.14016), which
-replaces LSTM hidden state with a small MLP + dilated convolution input layer.
+replaces the LSTM hidden state with a dilated causal convolution stack to give
+the policy a large temporal receptive field without recurrent state.
 Dilated causal convolutions (WaveNet-style) provide:
 
-  - Large receptive field with few parameters: RF = 1 + (k-1)·sum(2^i)
+  - Large receptive field with few parameters: RF = 1 + (k−1)·Σ 2^i
   - No vanishing gradients over long sequences (unlike LSTM)
-  - Fast inference: all time steps computed in parallel during training
+  - All time steps computed in parallel during training (fast)
   - Strictly causal: no future information leaks into the representation
 
-Architecture (default: 6 layers, kernel=3, dilation doubles each layer):
+Architecture (default: 8 layers, kernel=3, dilation doubles each layer):
 
-    Layer 0: dilation=1,  RF contribution = 2
-    Layer 1: dilation=2,  RF contribution = 4
-    Layer 2: dilation=4,  RF contribution = 8
-    Layer 3: dilation=8,  RF contribution = 16
-    Layer 4: dilation=16, RF contribution = 32
-    Layer 5: dilation=32, RF contribution = 64
-                                           ───
-    Total receptive field = 1 + 2+4+8+16+32+64 = 127 samples  (> window_size=64)
+    Layer 0: dilation=1,   RF contribution =   2
+    Layer 1: dilation=2,   RF contribution =   4
+    Layer 2: dilation=4,   RF contribution =   8
+    Layer 3: dilation=8,   RF contribution =  16
+    Layer 4: dilation=16,  RF contribution =  32
+    Layer 5: dilation=32,  RF contribution =  64
+    Layer 6: dilation=64,  RF contribution = 128
+    Layer 7: dilation=128, RF contribution = 256
+                                             ───
+    Total receptive field = 1 + 2+4+8+16+32+64+128+256 = 511 samples (= 127 s @ 4 Hz)
+
+This covers the full 240-sample (60 s) seismic observation window with margin.
+6 layers (RF=127) is insufficient for the seismic model — use ≥7 layers.
 
 The extractor reshapes the flat observation vector into (n_channels, window_size)
-before applying the convolutions.
+before applying the convolutions, then global-average-pools over time.
 
 Usage
 -----
@@ -31,7 +37,7 @@ Usage
 
     policy_kwargs = dict(
         features_extractor_class=DilatedCausalConvExtractor,
-        features_extractor_kwargs=dict(window_size=64, conv_channels=64, n_layers=6),
+        features_extractor_kwargs=dict(window_size=240, conv_channels=64, n_layers=8),
         net_arch=[256, 256],
     )
     model = PPO("MlpPolicy", env, policy_kwargs=policy_kwargs, ...)

@@ -1,6 +1,9 @@
 # RL4Seismic — RL-Based Seismic Noise Cancellation
 
-A reinforcement learning environment for active seismic noise cancellation, formulated as a **closed-loop control problem**. A PPO agent with an LSTM policy learns to track and subtract a physically motivated seismic coupling signal from a noisy main channel — benchmarked against classical adaptive filters (NLMS, IIR) and a supervised LSTM baseline.
+A reinforcement learning environment for active seismic noise cancellation, formulated as a **closed-loop control problem**. Two RL policies are implemented and benchmarked against classical adaptive filters (NLMS, IIR) and a supervised LSTM baseline:
+
+- **RecurrentPPO (LSTM)** — maintains hidden state across timesteps so the agent can adapt online within an episode, like an adaptive filter.
+- **Deep Loop Shaping (DLS)** — PPO with a WaveNet-style dilated causal convolution feature extractor, inspired by [arXiv:2509.14016](https://arxiv.org/abs/2509.14016) (DeepMind / Caltech, 2025). No recurrent state; temporal context comes from a large receptive field (511 samples = 127 s @ 4 Hz).
 
 Inspired by [arXiv:2511.19682](https://arxiv.org/abs/2511.19682) (Reissel et al., 2025), which applies supervised LSTMs to real LIGO data. This repository uses a synthetic simulator that matches the paper's signal processing parameters (4 Hz, 60 s context window, microseismic band) but models non-stationarity with an Ornstein–Uhlenbeck process — our own approximation, not from the paper.
 
@@ -94,8 +97,8 @@ Generates physically motivated seismic episodes: resonant FIR coupling, OU-drift
 - Action: `Box(1,)` in `[-15, +15]` — scalar coupling estimate
 - Reward: `y_t² − e_t²` — improvement in instantaneous squared amplitude
 
-**`noise_removal/policy.py`** — `DilatedCausalConvExtractor`.
-WaveNet-style dilated causal convolution feature extractor (alternative to LSTM). Receptive field = 127 samples with 6 layers.
+**`noise_removal/policy.py`** — `DilatedCausalConvExtractor` (Deep Loop Shaping policy).
+WaveNet-style dilated causal convolution feature extractor used with standard PPO. 8 layers, kernel=3, dilation doubles per layer → receptive field = 511 samples (127 s @ 4 Hz), covering the full 240-sample seismic window with margin. Inspired by [arXiv:2509.14016](https://arxiv.org/abs/2509.14016).
 
 **`baselines/lms_filter.py`** — Normalised LMS (NLMS) adaptive filter. Required for coloured seismic inputs (large eigenvalue spread makes plain LMS diverge).
 
@@ -135,8 +138,10 @@ python train.py --regime-changes
 # Longer run
 python train.py --timesteps 5_000_000
 
-# Dilated causal convolution policy instead of LSTM
-python train.py --dilated-conv --conv-layers 6 --conv-channels 64
+# Deep Loop Shaping policy (dilated causal conv) instead of LSTM
+python train.py --dilated-conv
+python train.py --dilated-conv --multi-source --tilt-coupling
+python train.py --dilated-conv --conv-layers 8 --conv-channels 64   # explicit defaults
 ```
 
 Saves model to `models/ppo_noise_cancellation.zip` and VecNormalize stats to `models/ppo_noise_cancellation_vecnorm.pkl`.
@@ -167,6 +172,50 @@ Saves plots to `results/noise_cancellation_overview.png`.
 
 ---
 
+## RL Policies
+
+Two policy architectures are available, both trained with PPO-family algorithms:
+
+### RecurrentPPO + LSTM (default)
+
+```bash
+python train.py                         # default
+python train.py --multi-source --tilt-coupling
+```
+
+Uses `sb3-contrib` `RecurrentPPO` with `MlpLstmPolicy` (hidden size 256). The LSTM carries state across timesteps within an episode, enabling the agent to track slow parameter drift and re-adapt after regime changes — analogous to an online adaptive filter but with a learned nonlinear strategy.
+
+### Deep Loop Shaping — Dilated Causal Conv (DLS)
+
+```bash
+python train.py --dilated-conv
+python train.py --dilated-conv --multi-source --tilt-coupling
+```
+
+Uses standard `PPO` with a `DilatedCausalConvExtractor` feature extractor, inspired by [arXiv:2509.14016](https://arxiv.org/abs/2509.14016) (DeepMind / Caltech). The extractor replaces the LSTM with a WaveNet-style stack of dilated causal convolutions:
+
+```
+Input: (batch, n_channels, 240 samples)
+  → input_proj   Conv1d n_channels → 64
+  → 8 × CausalConv1d (dilation = 1, 2, 4, …, 128)   RF = 511 samples = 127 s
+  → global average pool over time
+  → linear → 256-dim features
+  → PPO actor/critic heads
+```
+
+| Property | RecurrentPPO + LSTM | DLS (dilated conv) |
+|---|---|---|
+| Algorithm | RecurrentPPO | PPO |
+| Temporal memory | LSTM hidden state | Dilated conv receptive field |
+| Receptive field | Unbounded (recurrent) | 511 samples (127 s) |
+| Training | Sequential (recurrent rollouts) | Parallel (all timesteps at once) |
+| Vanishing gradients | Yes (long sequences) | No |
+| Inference | Step-by-step with state | Parallel over window |
+
+The DLS policy requires `--conv-layers ≥ 7` to cover the 240-sample (60 s) seismic observation window (7 layers → RF=255, 8 layers → RF=511).
+
+---
+
 ## Problem Variants
 
 | Flag | Coupling model | Linear filter floor |
@@ -190,7 +239,8 @@ Performance measured as RMS of the output signal normalised to the oracle (senso
 | NLMS filter | ~2–4× | linear, stable for coloured noise |
 | IIR adaptive filter | ~2–4× | adds residual feedback |
 | Supervised LSTM (arXiv:2511.19682) | ~1.5–3× | offline-trained |
-| RL agent (RecurrentPPO) | TBD | online adaptive |
+| RL — RecurrentPPO (LSTM) | TBD | online adaptive |
+| RL — Deep Loop Shaping (dilated conv) | TBD | online, no recurrent state |
 | **Oracle** | **1×** | sensor noise floor only |
 
 With `--tilt-coupling`, linear methods are bounded by `sqrt(rms(T2L)² + oracle²)` while the RL agent can in principle reach oracle.
