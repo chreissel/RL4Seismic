@@ -235,13 +235,13 @@ Performance measured as RMS of the output signal normalised to the oracle (senso
 
 | Method | vs Oracle | Notes |
 |--------|-----------|-------|
-| Raw main channel | ~40× | before subtraction |
-| NLMS filter | ~30–60× | linear FIR; T2L and slow 0.2 Hz resonance limit convergence |
-| IIR adaptive filter | ~30–60× | adds residual feedback; same linear floor |
-| Linear filter floor (T2L) | ~3–5× | hard floor from bilinear T2L term; no linear method can beat this |
-| Supervised LSTM (arXiv:2511.19682) | ~3–10× | offline-trained; limited by training episode mismatch |
-| RL — RecurrentPPO (LSTM) | TBD | online adaptive |
-| RL — Deep Loop Shaping (dilated conv) | TBD | online, no recurrent state |
+| Raw main channel | ~120× | before subtraction |
+| NLMS filter | ~100× | converges quickly on small linear coupling; T2L floor dominates |
+| IIR adaptive filter | ~100× | same linear floor as NLMS (feedback_length=0) |
+| **Linear filter floor (T2L)** | **~100×** | T2L RMS ≈ 5.0, sensor noise 0.05 → T2L is 99.99% of floor |
+| Supervised LSTM (arXiv:2511.19682) | ~10–50× | offline-trained; limited by training episode length |
+| RL — RecurrentPPO (LSTM) | TBD | online adaptive; can learn T2L gain from residual history |
+| RL — Deep Loop Shaping (dilated conv) | TBD | online; computes tilt×witness product directly from context |
 | **Oracle** | **1×** | sensor noise floor only |
 
 With `--tilt-coupling`, linear methods are bounded by `sqrt(rms(T2L)² + oracle²)` while the RL agent can in principle reach oracle.
