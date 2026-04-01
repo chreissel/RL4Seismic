@@ -350,6 +350,8 @@ def parse_args():
                    help="Skip supervised LSTM baseline (faster evaluation)")
     p.add_argument("--lstm-epochs", type=int, default=30,
                    help="Training epochs for the supervised LSTM (default: 30)")
+    p.add_argument("--dilated-conv", action="store_true",
+                   help="Load model as plain PPO (DLS) instead of RecurrentPPO")
     return p.parse_args()
 
 
@@ -411,8 +413,12 @@ def main():
                 if os.path.exists(candidate):
                     vecnorm = candidate
         if os.path.exists(model_zip) and os.path.exists(vecnorm):
-            from sb3_contrib import RecurrentPPO
-            model = RecurrentPPO.load(model_zip)
+            if args.dilated_conv:
+                from stable_baselines3 import PPO
+                model = PPO.load(model_zip)
+            else:
+                from sb3_contrib import RecurrentPPO
+                model = RecurrentPPO.load(model_zip)
             print(f"Loaded model from {model_zip}")
             rl_clean = run_rl_agent(data, model, vecnorm, window_size=window_size, config=cfg)
             print("RL rollout done.")
