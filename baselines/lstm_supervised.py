@@ -46,7 +46,7 @@ except ImportError:
     _HAS_TORCH = False
 
 
-class _LSTMNet(nn.Module):
+class _LSTMNet(nn.Module if _HAS_TORCH else object):
     def __init__(self, input_size: int, hidden_size: int = 128, n_layers: int = 3):
         super().__init__()
         self.lstm = nn.LSTM(
