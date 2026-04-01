@@ -8,16 +8,16 @@ internal model, and correcting — rather than applying a fixed open-loop
 mapping as a plain MLP would.
 
 The physically motivated seismic model (4 Hz, resonant FIR coupling,
-OU-drifting parameters) is always used.  Optional extensions:
-  --multi-source   : add a second seismometer channel
-  --tilt-coupling  : add bilinear tilt-to-length coupling (requires --multi-source)
-  --regime-changes : sudden coupling path switches (Poisson process)
+OU-drifting parameters, two witness channels X/Y) is always used.  Options:
+  --no-tilt-coupling : train on X coupling only (no tilt-horizontal term)
+  --no-drift         : disable OU drift (stationary system; easier for baselines)
+  --regime-changes   : sudden coupling path switches (Poisson process)
 
 Usage
 -----
-    python train.py                          # default settings
+    python train.py                          # default: X coupling + tilt-horizontal
     python train.py --timesteps 5_000_000   # longer run
-    python train.py --multi-source --tilt-coupling
+    python train.py --no-tilt-coupling       # X coupling only
 
 The trained model is saved to  models/ppo_noise_cancellation.zip
 and VecNormalize stats to      models/ppo_noise_cancellation_vecnorm.pkl
@@ -54,14 +54,17 @@ def parse_args():
                    help="Path to save the trained model (without .zip)")
     p.add_argument("--log-dir", type=str, default="logs/ppo_noise_cancellation",
                    help="Tensorboard log directory")
-    p.add_argument("--multi-source", action="store_true",
-                   help="Enable second seismometer channel with independent FIR coupling")
+    p.add_argument("--no-drift", action="store_true",
+                   help="Disable OU drift of coupling parameters (stationary system; "
+                        "useful for debugging linear baselines)")
     p.add_argument("--regime-changes", action="store_true",
                    help="Enable sudden coupling regime switches (Poisson process); "
                         "adaptive filters must re-converge after each jump")
-    p.add_argument("--tilt-coupling", action="store_true",
-                   help="Add bilinear tilt-to-length cross-coupling "
-                        "(requires --multi-source): C_T2L = T(t)·θ(t)·w1(t)")
+    p.add_argument("--tilt-coupling", action="store_true", default=True,
+                   help="Include tilt-horizontal coupling from Y witness channel "
+                        "(default: on). C_tilt(t) = T(t)·θ_y_proxy(t)")
+    p.add_argument("--no-tilt-coupling", action="store_true",
+                   help="Disable tilt-horizontal coupling (train on X coupling only)")
     p.add_argument("--freq-reward", action="store_true",
                    help="Use frequency-domain reward: improve power in [freq-low, freq-high] Hz")
     p.add_argument("--freq-low", type=float, default=0.05,
@@ -99,9 +102,9 @@ def main():
     os.makedirs(args.log_dir, exist_ok=True)
 
     config = SeismicConfig(
-        multi_source=args.multi_source,
+        drift=not args.no_drift,
         regime_changes=args.regime_changes,
-        tilt_coupling=args.tilt_coupling,
+        tilt_coupling=not args.no_tilt_coupling,
     )
 
     window_size = args.window_size if args.window_size is not None else config.filter_length
@@ -111,16 +114,17 @@ def main():
     print(f"  RL Seismic Noise Cancellation — {algo_name}")
     print("=" * 60)
     print(f"  Sampling rate  : {config.fs} Hz")
-    print(f"  Sensor noise σ : {config.sensor_noise_sigma}")
-    if config.multi_source and config.tilt_coupling:
-        print(f"  Coupling model : h1(t)⊛w1 + h2(t)⊛w2 + T(t)·θ(t)·w1  (seismic + T2L)")
-    elif config.multi_source:
-        print(f"  Coupling model : h1(t)⊛w1 + h2(t)⊛w2  (seismic multi-source)")
+    print(f"  Sensor noise σ : {config.sensor_noise_sigma}  (GS13X obtaining channel)")
+    drift_str = "OU-drifting" if config.drift else "stationary"
+    if config.tilt_coupling and config.regime_changes:
+        print(f"  Coupling model : h_x(t)⊛w_x + C_tilt(t)  [{drift_str}, {config.n_regimes} regimes]")
+    elif config.tilt_coupling:
+        print(f"  Coupling model : h_x(t)⊛w_x + T(t)·θ_y(t)  [{drift_str}] (X + tilt-horizontal)")
     elif config.regime_changes:
-        print(f"  Coupling model : h_k⊛w  ({config.n_regimes} FIR regimes, "
+        print(f"  Coupling model : h_k⊛w_x  ({config.n_regimes} FIR regimes, "
               f"mean hold {config.mean_hold_time:.0f} s)")
     else:
-        print(f"  Coupling model : h(t)⊛w  (OU-drifting resonant FIR)")
+        print(f"  Coupling model : h_x(t)⊛w_x  [{drift_str} resonant FIR, X only]")
     print(f"  Window size    : {window_size} samples = {window_size/config.fs:.1f} s")
     print(f"  Episode length : {args.episode_duration} s")
     print(f"  Total steps    : {args.timesteps:,}")

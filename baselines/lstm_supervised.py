@@ -29,7 +29,7 @@ Usage
 >>> from baselines import SupervisedLSTM
 >>> lstm = SupervisedLSTM(window_size=240)
 >>> lstm.fit(train_data, verbose=True)      # offline training episode
->>> cleaned = lstm.run(eval_data['witness'], eval_data['main'])
+>>> cleaned = lstm.run(eval_data['witness_x'], eval_data['main'], eval_data['witness_y'])
 """
 
 from __future__ import annotations
@@ -116,26 +116,26 @@ class SupervisedLSTM:
         """
         Train the LSTM on a labelled episode.
 
-        Input at step t : witness window  witness[t-W+1 .. t]  (and witness2 if present)
+        Input at step t : witness window  witness_x[t-W+1 .. t]  (and witness_y)
         Target at step t: main[t]  (= coupling + sensor noise; residual after subtraction)
 
         Parameters
         ----------
-        data    : episode dict from SignalSimulator / SeismicSignalSimulator
+        data    : episode dict from SeismicSignalSimulator
         verbose : print loss every 10 epochs
         """
         W = self.window_size
-        witness = np.asarray(data["witness"], dtype=np.float32)
-        main    = np.asarray(data["main"],    dtype=np.float32)
+        witness_x = np.asarray(data["witness_x"], dtype=np.float32)
+        main      = np.asarray(data["main"],      dtype=np.float32)
         N = len(main)
 
-        n_inputs = 2 if "witness2" in data else 1
+        n_inputs = 2 if "witness_y" in data else 1
         self._n_inputs = n_inputs
         self._net = _LSTMNet(n_inputs, self._hidden_size, self._n_layers)
 
         # Build dataset: (N - W + 1) windows
-        xs, ys = self._build_windows(witness, main,
-                                     data.get("witness2"), W, N)
+        xs, ys = self._build_windows(witness_x, main,
+                                     data.get("witness_y"), W, N)
         X = torch.from_numpy(np.array(xs, dtype=np.float32))  # (n, W, c)
         y = torch.from_numpy(np.array(ys, dtype=np.float32))  # (n,)
 
@@ -170,9 +170,9 @@ class SupervisedLSTM:
 
     def run(
         self,
-        witness:  np.ndarray,
-        main:     np.ndarray,
-        witness2: Optional[np.ndarray] = None,
+        witness_x: np.ndarray,
+        main:      np.ndarray,
+        witness_y: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
         Causal inference: subtract the LSTM prediction from main.
@@ -181,9 +181,9 @@ class SupervisedLSTM:
 
         Parameters
         ----------
-        witness  : (N,) witness channel
-        main     : (N,) main channel
-        witness2 : (N,) optional second witness channel
+        witness_x : (N,) witness X channel (inline, translational)
+        main      : (N,) main (obtaining) channel
+        witness_y : (N,) witness Y channel (perpendicular, tilt source; optional)
 
         Returns
         -------
@@ -193,11 +193,11 @@ class SupervisedLSTM:
             raise RuntimeError("Call fit() before run()")
 
         W = self.window_size
-        witness = np.asarray(witness, dtype=np.float32)
-        main    = np.asarray(main,    dtype=np.float32)
+        witness_x = np.asarray(witness_x, dtype=np.float32)
+        main      = np.asarray(main,      dtype=np.float32)
         N = len(main)
 
-        xs, _ = self._build_windows(witness, main, witness2, W, N,
+        xs, _ = self._build_windows(witness_x, main, witness_y, W, N,
                                     build_targets=False)
         if len(xs) == 0:
             return main.copy().astype(float)
@@ -219,23 +219,23 @@ class SupervisedLSTM:
 
     @staticmethod
     def _build_windows(
-        witness:  np.ndarray,
-        main:     np.ndarray,
-        witness2: Optional[np.ndarray],
+        witness_x: np.ndarray,
+        main:      np.ndarray,
+        witness_y: Optional[np.ndarray],
         W: int,
         N: int,
         build_targets: bool = True,
     ):
         n_samples = max(0, N - W + 1)
-        n_inputs  = 2 if witness2 is not None else 1
+        n_inputs  = 2 if witness_y is not None else 1
 
         xs = np.empty((n_samples, W, n_inputs), dtype=np.float32)
         ys = np.empty(n_samples,                dtype=np.float32)
 
         for i, t in enumerate(range(W - 1, N)):
-            xs[i, :, 0] = witness[t - W + 1 : t + 1]
-            if witness2 is not None:
-                xs[i, :, 1] = witness2[t - W + 1 : t + 1]
+            xs[i, :, 0] = witness_x[t - W + 1 : t + 1]
+            if witness_y is not None:
+                xs[i, :, 1] = witness_y[t - W + 1 : t + 1]
             if build_targets:
                 ys[i] = main[t]
 

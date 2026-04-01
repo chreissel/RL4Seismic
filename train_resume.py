@@ -9,7 +9,7 @@ Usage
                            --extra-steps 200000
 
     python train_resume.py --checkpoint models/ppo_noise_cancellation_100000_steps \\
-                           --extra-steps 200000 --multi-source --tilt-coupling
+                           --extra-steps 200000
 """
 
 import argparse
@@ -32,9 +32,11 @@ def parse_args():
     p.add_argument("--window-size", type=int, default=None,
                    help="Observation window in samples (default: 240 = 60 s @ 4 Hz)")
     p.add_argument("--episode-duration", type=float, default=300.0)
-    p.add_argument("--multi-source", action="store_true")
+    p.add_argument("--no-drift", action="store_true",
+                   help="Disable OU drift of coupling parameters")
     p.add_argument("--regime-changes", action="store_true")
-    p.add_argument("--tilt-coupling", action="store_true")
+    p.add_argument("--no-tilt-coupling", action="store_true",
+                   help="Disable tilt-horizontal coupling (X only)")
     return p.parse_args()
 
 
@@ -69,9 +71,9 @@ def main():
     args = parse_args()
 
     config = SeismicConfig(
-        multi_source=args.multi_source,
+        drift=not args.no_drift,
         regime_changes=args.regime_changes,
-        tilt_coupling=args.tilt_coupling,
+        tilt_coupling=not args.no_tilt_coupling,
     )
 
     window_size = args.window_size if args.window_size is not None else config.filter_length

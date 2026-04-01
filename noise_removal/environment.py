@@ -3,22 +3,21 @@ Gymnasium environment for online seismic noise cancellation (closed-loop formula
 
 Closed-loop block diagram:
 
-    w1_t ──→ [ Plant P(z) ] ──→ y_t = h(t)⊛w1_t + [T2L] + n_t
-    w2_t ─┘                            │
+    w_x_t ──→ [ Plant P(z) ] ──→ y_t = h_x(t)⊛w_x_t + C_tilt_t + n_GS13X_t
+    w_y_t ─┘                            │
       │                         ─── (+) ──→ e_t = y_t − a_t  (error / residual)
       │                        │
       └──→ [ Controller C ] ──→ a_t
             (RL policy π)
 
-Single-source observation (default, 2·W floats):
-    [ witness1[t-W+1..t],  residual[t-W..t-1] ]
+Observation (3·W floats):
+    [ witness_x[t-W+1..t],  witness_y[t-W+1..t],  residual[t-W..t-1] ]
 
-Multi-source observation (config.multi_source=True, 3·W floats):
-    [ witness1[t-W+1..t],  witness2[t-W+1..t],  residual[t-W..t-1] ]
-
-The second witness window gives the agent the information needed to learn
-the tilt-to-length bilinear cross-coupling T(t)·θ(t)·w1(t), which linear
-adaptive filters (LMS/NLMS) cannot cancel.
+The witness_y window gives the agent the information needed to learn the
+tilt-horizontal coupling C_tilt(t) = T(t) · θ_y_proxy(t), which requires
+tracking the slowly drifting gain T(t).  Static linear adaptive filters
+(LMS/NLMS) must re-converge each time T(t) drifts; the RL agent can learn
+to anticipate T(t) changes from the residual history.
 """
 
 from __future__ import annotations
@@ -35,10 +34,11 @@ from .signals import SeismicConfig, SeismicSignalSimulator
 
 class NoiseCancellationEnv(gym.Env):
     """
-    Noise-cancellation environment (single- or multi-source).
+    Noise-cancellation environment with one obtaining channel and two witness
+    channels (X direction translational + Y direction tilt-horizontal).
 
-    Observation space : Box(n_witnesses·W + W,)
-        [ witness1[t-W+1..t], [witness2[t-W+1..t],]  residual[t-W..t-1] ]
+    Observation space : Box(3·W,)
+        [ witness_x[t-W+1..t],  witness_y[t-W+1..t],  residual[t-W..t-1] ]
 
     Action space : Box(1,)  in  [-action_clip, +action_clip]
 
@@ -49,7 +49,7 @@ class NoiseCancellationEnv(gym.Env):
 
     Parameters
     ----------
-    config           : SeismicConfig (set config.multi_source=True for two channels)
+    config           : SeismicConfig
     window_size      : W — observation window length in samples
     episode_duration : episode length in seconds
     action_clip      : symmetric bound on the action space (default 40.0)
@@ -65,7 +65,7 @@ class NoiseCancellationEnv(gym.Env):
         config: Optional[SeismicConfig] = None,
         window_size: int = 240,
         episode_duration: float = 300.0,
-        action_clip: float = 40.0,   # t2l_gain=5.0 → T_gain_max=12.5, peak T2L ≈ 37; +3 linear
+        action_clip: float = 40.0,   # t2l_gain=8.0 → T_gain_max=20.0, peak tilt ≈ 20; +0.5 linear
         freq_reward: bool = False,
         freq_band_low: float = 0.05,
         freq_band_high: float = 1.5,
@@ -77,9 +77,8 @@ class NoiseCancellationEnv(gym.Env):
         self.action_clip = action_clip
         self.freq_reward = freq_reward
 
-        # obs = [w1_win, (w2_win,) residual_win]
-        n_witness_channels = 2 if self.config.multi_source else 1
-        obs_dim = (n_witness_channels + 1) * window_size
+        # obs = [witness_x_win, witness_y_win, residual_win]  (always 3 channels)
+        obs_dim = 3 * window_size
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
         )
@@ -169,18 +168,13 @@ class NoiseCancellationEnv(gym.Env):
         t = self._step_idx
         W = self.window_size
 
-        witness_win  = self._data["witness"][t - W + 1 : t + 1]
-        main_win     = self._data["main"][t - W : t]
-        action_win   = self._action_history[t - W : t]
-        residual_win = (main_win - action_win).astype(np.float32)
+        witness_x_win = self._data["witness_x"][t - W + 1 : t + 1]
+        witness_y_win = self._data["witness_y"][t - W + 1 : t + 1]
+        main_win      = self._data["main"][t - W : t]
+        action_win    = self._action_history[t - W : t]
+        residual_win  = (main_win - action_win).astype(np.float32)
 
-        parts = [witness_win]
-        if self.config.multi_source:
-            parts.append(self._data["witness2"][t - W + 1 : t + 1])
-        parts.append(residual_win)
-
-        return np.concatenate(parts).astype(np.float32)
+        return np.concatenate([witness_x_win, witness_y_win, residual_win]).astype(np.float32)
 
     def _zero_obs(self) -> np.ndarray:
-        n_witness_channels = 2 if self.config.multi_source else 1
-        return np.zeros((n_witness_channels + 1) * self.window_size, dtype=np.float32)
+        return np.zeros(3 * self.window_size, dtype=np.float32)

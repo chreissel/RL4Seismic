@@ -1,37 +1,62 @@
 """
 Signal generation for RL-based seismic noise cancellation.
 
-Physical setup
---------------
-Models a LIGO-like witness-based noise cancellation system:
+Physical setup (arXiv:2511.19682, Reissel et al. 2025)
+-------------------------------------------------------
+Models a LIGO-like witness-based noise cancellation system with one obtaining
+channel and two witness channels measuring seismic disturbance in X and Y:
 
-    y(t) = h(t) ⊛ w(t)  +  n_sensor(t)
+    y(t) = h_x(t) ⊛ w_x(t)  +  C_tilt(t)  +  n_GS13X(t)
 
 where:
-  - w(t)          : seismic ground motion (coloured broadband noise)
-  - h(t)          : slowly drifting resonant FIR coupling filter
+  - w_x(t)        : seismic ground motion in X direction (witness X channel)
+  - w_y(t)        : seismic ground motion in Y direction (witness Y channel)
+  - h_x(t)        : slowly drifting resonant FIR coupling filter for X
                     (mechanical transfer function, Ornstein–Uhlenbeck drift)
-  - n_sensor(t)   : i.i.d. Gaussian sensor noise
+  - C_tilt(t)     : tilt-horizontal coupling from Y seismic (see below)
+  - n_GS13X(t)    : GS13X seismometer sensor noise in the obtaining channel
 
-Coupling models
----------------
-Single-source (default):
-    y(t) = h(t) ⊛ w1(t)
-    Linear FIR coupling with OU-drifting resonance frequency and gain.
+Obtaining channel
+-----------------
+The main (obtaining) channel is modelled as a GS13X broadband seismometer
+measuring the LIGO test-mass degree of freedom.  Its self-noise floor is
+captured by additive Gaussian noise n_GS13X(t) ~ N(0, σ²_sensor).
 
-Multi-source (multi_source=True):
-    y(t) = h1(t) ⊛ w1(t)  +  h2(t) ⊛ w2(t)
-    Two independent seismometers with separate FIR couplings.
+Witness channels
+----------------
+Two horizontal seismometers:
+  w_x(t) : X-direction ground motion (inline with interferometer arm)
+  w_y(t) : Y-direction ground motion (perpendicular to interferometer arm)
 
-Tilt-to-length (tilt_coupling=True, requires multi_source):
-    y(t) = h1(t)⊛w1 + h2(t)⊛w2 + T(t)·θ_proxy(t)·w1(t)
-    The T2L term is a bilinear product of tilt proxy and horizontal motion.
-    It CANNOT be cancelled by any linear two-channel filter (LMS/NLMS).
-    An RL agent that learns the product can approach oracle performance.
+Each has a small additive self-noise term.
 
-Regime changes (regime_changes=True):
-    Coupling path jumps between K discrete FIR filters at Poisson-distributed
-    times, representing sudden coupling path changes (lock-loss, alignment jump).
+Tilt-horizontal coupling
+------------------------
+Low-frequency seismic waves (Rayleigh waves) tilt the ground.  The Y-direction
+seismic motion creates a ground tilt about the X axis:
+
+    θ_y(t) ≈ (1/c_R) · dw_y/dt
+
+This tilt couples into the main channel via the alignment-dependent gain T(t):
+
+    C_tilt(t) = T(t) · θ_y_proxy(t)
+
+where θ_y_proxy[t] = (w_y[t] − w_y[t−1]) / rms  is a finite-difference
+approximation of dw_y/dt (normalised to unit RMS), and T(t) is the
+OU-drifting tilt-horizontal coupling gain representing the slowly changing
+mirror alignment.
+
+For constant T, any linear adaptive filter can cancel C_tilt by learning the
+transfer function θ_y → main.  With drifting T(t) the filter must track the
+gain; RL can exploit the slowly varying structure more effectively.
+
+Setting drift=False freezes T(t) = t2l_gain (constant), making C_tilt a
+purely linear function of w_y — cancellable by a static linear filter.
+
+Regime changes (regime_changes=True)
+-------------------------------------
+Coupling path jumps between K discrete FIR filters at Poisson-distributed
+times, representing sudden coupling path changes (lock-loss, alignment jump).
 
 Signal processing parameters follow arXiv:2511.19682 (Reissel et al., 2025):
   - 4 Hz sampling rate (matching their downsampled data stream)
@@ -64,10 +89,10 @@ class SeismicConfig:
     """
     Physical parameters for the seismic noise cancellation problem.
 
-    Models a LIGO-like witness-based noise cancellation setup:
-      y(t) = h(t) ⊛ w(t)  +  n_sensor(t)
-    where h(t) is a slowly drifting resonant FIR coupling filter and
-    w(t) is broadband seismic ground motion.
+    Models a LIGO-like witness-based noise cancellation setup with one
+    obtaining channel (GS13X sensor) and two witness channels (X and Y):
+
+      y(t) = h_x(t) ⊛ w_x(t)  +  C_tilt(t)  +  n_GS13X(t)
 
     Signal processing parameters follow arXiv:2511.19682 (Reissel et al., 2025):
       - 4 Hz sampling rate (matching their downsampled data stream)
@@ -80,62 +105,67 @@ class SeismicConfig:
     sudden discontinuities from lock-loss and maintenance).  The OU process here
     captures only the slow mean-reverting component; --regime-changes adds sudden
     coupling path switches on top.
+
+    Setting drift=False disables all Ornstein–Uhlenbeck drift, giving stationary
+    coupling parameters.  This is useful for testing linear baselines: with
+    drift=False and tilt_coupling=False, NLMS should converge to near-oracle
+    performance.
     """
 
     # --- sampling ---
-    fs: float = 4.0                     # Hz — matches paper's 4 Hz downsampled rate
+    fs: float = 4.0                      # Hz — matches paper's 4 Hz downsampled rate
 
-    # --- seismic ground motion ---
-    seismic_amplitude: float = 1.0      # normalised RMS of witness channel
-    witness_noise_sigma: float = 0.02   # seismometer self-noise (small)
+    # --- seismic ground motion (both witness channels) ---
+    seismic_amplitude: float = 1.0       # normalised RMS of each witness channel
+    witness_noise_sigma: float = 0.02    # seismometer self-noise (both X and Y channels)
 
-    # --- coupling filter (microseismic resonance) ---
-    filter_length: int = 240            # FIR taps = 60 s × 4 Hz (paper context window)
-    coupling_gain: float = 0.5          # nominal coupling RMS gain (reduced from 2.0 so
-                                        # NLMS converges quickly to its linear floor,
-                                        # cleanly exposing the T2L residual)
-    resonance_freq: float = 0.14        # Hz  — secondary microseism peak (7 s period)
-    resonance_q: float = 8.0            # quality factor Q = f_r / bandwidth (sharper)
+    # --- X-direction coupling filter (translational, inline with interferometer arm) ---
+    filter_length: int = 240             # FIR taps = 60 s × 4 Hz (paper context window)
+    coupling_gain: float = 0.5           # nominal coupling RMS gain (reduced from 2.0 so
+                                         # NLMS converges quickly to its linear floor,
+                                         # cleanly exposing the tilt coupling residual)
+    resonance_freq: float = 0.14         # Hz  — secondary microseism peak (7 s period)
+    resonance_q: float = 8.0             # quality factor Q = f_r / bandwidth (sharper)
 
     # --- thermal / alignment drift (Ornstein–Uhlenbeck) ---
-    thermal_timescale: float = 600.0    # seconds  (≈ 10 min thermal time const.)
-    gain_drift_sigma: float = 0.1       # OU stationary std of gain fluctuation (reduced
-                                        # from 0.3 — slower drift lets NLMS converge)
-    freq_drift_sigma: float = 0.01      # Hz — reduced from 0.03 (stable resonance)
+    # Set drift=False to freeze all coupling parameters (stationary system).
+    # Useful for verifying linear baselines and isolating the tilt-coupling
+    # challenge from the drift challenge.
+    drift: bool = True                   # enable OU-drifting coupling parameters
+    thermal_timescale: float = 600.0     # seconds  (≈ 10 min thermal time const.)
+    gain_drift_sigma: float = 0.1        # OU stationary std of gain fluctuation
+    freq_drift_sigma: float = 0.01       # Hz — resonance frequency drift std
 
-    # --- main channel sensor noise ---
-    sensor_noise_sigma: float = 0.05    # residual noise after passive isolation
+    # --- GS13X obtaining channel sensor noise ---
+    # The GS13X (Geotech S-13) is a short-period (1 Hz) broadband seismometer
+    # used at LIGO to sense test-mass motion.  Its self-noise floor is modelled
+    # as additive white Gaussian noise with amplitude sensor_noise_sigma.
+    sensor_noise_sigma: float = 0.05     # GS13X-like sensor noise (obtaining channel)
 
     # --- regime changes (sudden coupling path change) ---
     regime_changes: bool = False
     n_regimes: int = 4
-    mean_hold_time: float = 120.0       # seconds — longer holds at 4 Hz
+    mean_hold_time: float = 120.0        # seconds — longer holds at 4 Hz
 
-    # --- multi-source (second seismometer / rotational DOF) ---
-    # Mirrors the paper's multi-DOF setup where translational and rotational
-    # channels couple nonlinearly (tilt-to-length mechanism).
-    multi_source: bool = True
-    w2_coupling_gain: float = 0.4       # reduced from 1.5 (matches coupling_gain reduction)
-    w2_resonance_freq: float = 0.35     # Hz  — slightly different resonance
-    w2_resonance_q: float = 4.0
-
-    # --- tilt-to-length bilinear cross-coupling (requires multi_source=True) ---
-    # Models the Rayleigh-wave tilt-to-length mechanism:
-    #   C_T2L(t) = T(t) · [H_tilt ⊛ w2(t)] · w1(t)
-    # where H_tilt is a finite-difference approximation of d/dt (tilt proxy)
-    # and T(t) is an OU-drifting alignment-dependent coupling gain.
-    # This is the dominant nonlinearity identified in arXiv:2511.19682.
+    # --- tilt-horizontal coupling (Y seismic → ground tilt → main channel) ---
+    # Rayleigh waves propagating along Y create ground tilt about the X axis.
+    # This tilt couples into the main channel via the alignment-dependent gain T(t):
     #
-    # With coupling_gain=0.5, NLMS converges to a linear residual RMS of ~0.1-0.3.
-    # T2L RMS ≈ t2l_gain = 8.0, so T2L accounts for >99.99% of the residual floor:
-    #   T2L fraction = 8.0² / (8.0² + 0.05²) ≈ 99.998%
-    # This makes the nonlinear floor unambiguous, and the RL improvement clear.
+    #   C_tilt(t) = T(t) · θ_y_proxy(t)
+    #
+    # where θ_y_proxy[t] = (w_y[t] − w_y[t−1]) / rms  is a normalised first-
+    # difference of the Y seismometer (proxy for dw_y/dt ∝ tilt angle), and
+    # T(t) is the OU-drifting alignment-dependent gain.
+    #
+    # With drift=True, T(t) is non-stationary (OU), so static linear filters
+    # cannot fully cancel C_tilt without re-adapting.  With drift=False, T is
+    # constant and a static linear filter CAN cancel C_tilt.
     tilt_coupling: bool = True
-    t2l_gain: float = 8.0               # T2L RMS ≈ 8.0, linear floor ≈ 160× oracle
-                                        # clearly dominant over NLMS linear floor (~0.3)
-                                        # T_gain clipped at 8.0 × 2.5 = 20.0 → peak T2L ≈ 60
-    t2l_gain_drift_sigma: float = 0.5   # OU fluctuation of T2L gain
-    t2l_thermal_timescale: float = 600.0  # seconds — alignment changes slowly
+    t2l_gain: float = 8.0               # mean tilt-horizontal coupling gain
+                                         # (T2L RMS ≈ t2l_gain >> linear coupling ≈ 0.5,
+                                         #  making the tilt term the dominant residual floor)
+    t2l_gain_drift_sigma: float = 0.5   # OU fluctuation of T(t)
+    t2l_thermal_timescale: float = 600.0 # seconds — alignment changes slowly
 
 
 # ---------------------------------------------------------------------------
@@ -252,12 +282,16 @@ class SeismicSignalSimulator:
     """
     Generates one episode of seismic noise cancellation data.
 
-    The coupling is a linear time-varying FIR filter (resonant mechanical
-    transfer function) with parameters drifting via Ornstein–Uhlenbeck
-    (thermal) or step-change (coupling-path switch).
+    Physical setup:
+      - One obtaining channel (GS13X sensor) measuring interferometer output
+      - Two witness channels: X direction (translational) and Y direction
+      - X coupling: linear time-varying FIR filter with optional OU drift
+      - Tilt-horizontal coupling: Y seismic → ground tilt → main channel
 
-    Optionally includes a second witness channel (multi_source) and/or
-    a bilinear tilt-to-length coupling term (tilt_coupling).
+    The tilt-horizontal coupling C_tilt(t) = T(t) · θ_y_proxy(t) is a bilinear
+    product of the slowly drifting alignment gain T(t) and the normalised
+    first-difference of witness_y (tilt proxy).  With drift=True, static linear
+    filters cannot track the drifting T(t); with drift=False they can.
 
     Usage
     -----
@@ -265,11 +299,13 @@ class SeismicSignalSimulator:
     >>> sim = SeismicSignalSimulator(cfg, seed=0)
     >>> data = sim.generate_episode(duration=300.0)
     >>> data.keys()
-    dict_keys(['time', 'witness', 'main', 'coupling', 'sensor_noise', 'true_signal'])
+    dict_keys(['time', 'witness_x', 'witness_y', 'main', 'coupling',
+               'coupling_tilt', 'sensor_noise', 'true_signal'])
 
-    With multi_source=True the dict also contains 'witness2'.
-    With tilt_coupling=True the dict also contains 'coupling_t2l'.
     With regime_changes=True the dict also contains 'regime'.
+
+    Legacy keys 'witness' (= witness_x) and 'witness2' (= witness_y) are also
+    included for backward compatibility.
     """
 
     def __init__(self, config: SeismicConfig, seed: Optional[int] = None):
@@ -287,26 +323,36 @@ class SeismicSignalSimulator:
 
         Returns
         -------
-        dict with keys
-          'time'         : (N,) time axis in seconds
-          'witness'      : (N,) witness channel 1 (horizontal seismometer)
-          'witness2'     : (N,) witness channel 2  [multi_source only]
-          'main'         : (N,) main channel
-          'coupling'     : (N,) total coupling (sum of all terms)
-          'coupling_t2l' : (N,) T2L bilinear term  [tilt_coupling only]
-          'sensor_noise' : (N,) Gaussian sensor noise
-          'true_signal'  : (N,) injected test signal (zeros during training)
-          'regime'       : (N,) int regime index  [regime_changes only]
+        dict with keys:
+          'time'          : (N,) time axis in seconds
+          'witness_x'     : (N,) witness channel X (horizontal, inline with arm)
+          'witness_y'     : (N,) witness channel Y (horizontal, perpendicular)
+          'main'          : (N,) obtaining channel (GS13X sensor + coupling)
+          'coupling'      : (N,) total coupling (X FIR + tilt-horizontal term)
+          'coupling_tilt' : (N,) tilt-horizontal coupling term  [tilt_coupling only]
+          'sensor_noise'  : (N,) GS13X sensor noise
+          'true_signal'   : (N,) injected test signal (zeros during training)
+          'regime'        : (N,) int regime index  [regime_changes only]
+
+        Legacy keys 'witness' (alias for witness_x) and 'witness2' (alias for
+        witness_y) are also present for backward compatibility.
         """
         cfg = self.config
         n = int(duration * cfg.fs)
         t = np.arange(n) / cfg.fs
 
-        # --- witness channel (seismic ground motion + self-noise) ---
-        witness = _seismic_ground_motion(n, cfg.seismic_amplitude, cfg.fs, self.rng)
-        witness += self.rng.normal(0.0, cfg.witness_noise_sigma, n)
+        # --- witness X: seismic ground motion in X direction + self-noise ---
+        witness_x = _seismic_ground_motion(n, cfg.seismic_amplitude, cfg.fs, self.rng)
+        witness_x += self.rng.normal(0.0, cfg.witness_noise_sigma, n)
 
-        # --- sensor noise (small residual in main channel) ---
+        # --- witness Y: seismic ground motion in Y direction + self-noise ---
+        # Y is partially correlated with X (same wavefield) but independent
+        witness_y = _seismic_ground_motion(
+            n, cfg.seismic_amplitude * 0.8, cfg.fs, self.rng
+        )
+        witness_y += self.rng.normal(0.0, cfg.witness_noise_sigma, n)
+
+        # --- GS13X sensor noise (obtaining channel) ---
         sensor_noise = self.rng.normal(0.0, cfg.sensor_noise_sigma, n)
 
         # --- injected test signal (zero during training) ---
@@ -316,50 +362,40 @@ class SeismicSignalSimulator:
             else np.zeros(n)
         )
 
-        # --- primary coupling ---
+        # --- X coupling: translational FIR from inline seismic (with optional drift) ---
         if cfg.regime_changes:
-            coupling, regime = self._regime_coupling(witness, n)
+            coupling, regime = self._regime_coupling(witness_x, n)
         else:
             coupling = self._drifting_coupling(
-                witness, n,
+                witness_x, n,
                 cfg.coupling_gain, cfg.resonance_freq, cfg.resonance_q,
                 cfg.gain_drift_sigma, cfg.freq_drift_sigma,
             )
             regime = None
 
-        # --- optional second seismometer ---
-        witness2 = None
-        coupling_t2l = None
-        if cfg.multi_source:
-            witness2 = _seismic_ground_motion(
-                n, cfg.seismic_amplitude * 0.8, cfg.fs, self.rng
-            )
-            witness2 += self.rng.normal(0.0, cfg.witness_noise_sigma, n)
-            coupling2 = self._drifting_coupling(
-                witness2, n,
-                cfg.w2_coupling_gain, cfg.w2_resonance_freq, cfg.w2_resonance_q,
-                cfg.gain_drift_sigma * 0.8, cfg.freq_drift_sigma * 0.5,
-            )
-            coupling = coupling + coupling2
-
-            if cfg.tilt_coupling:
-                coupling_t2l = self._tilt_to_length_coupling(witness, witness2, n)
-                coupling = coupling + coupling_t2l
+        # --- tilt-horizontal coupling: Y seismic → ground tilt → main channel ---
+        coupling_tilt = None
+        if cfg.tilt_coupling:
+            coupling_tilt = self._tilt_horizontal_coupling(witness_y, n)
+            coupling = coupling + coupling_tilt
 
         main = true_signal + sensor_noise + coupling
 
         result = {
             "time": t,
-            "witness": witness,
+            "witness_x": witness_x,
+            "witness_y": witness_y,
+            # legacy aliases (backward compatibility)
+            "witness": witness_x,
+            "witness2": witness_y,
             "main": main,
             "coupling": coupling,
             "sensor_noise": sensor_noise,
             "true_signal": true_signal,
         }
-        if witness2 is not None:
-            result["witness2"] = witness2
-        if coupling_t2l is not None:
-            result["coupling_t2l"] = coupling_t2l
+        if coupling_tilt is not None:
+            result["coupling_tilt"] = coupling_tilt
+            result["coupling_t2l"] = coupling_tilt   # legacy alias
         if regime is not None:
             result["regime"] = regime
         return result
@@ -379,24 +415,25 @@ class SeismicSignalSimulator:
         freq_sigma: float,
     ) -> np.ndarray:
         """
-        Time-varying linear FIR coupling with OU-drifting parameters.
+        Time-varying linear FIR coupling with optional OU-drifting parameters.
 
-        The resonance frequency and gain follow independent OU processes,
-        representing slow thermal / alignment drift.  The filter is
-        recomputed at each sample from the current parameters.
+        When config.drift=True, the resonance frequency and gain follow
+        independent OU processes, representing slow thermal / alignment drift.
+        When config.drift=False, fixed nominal values are used (stationary
+        system — linear baselines should converge to near-oracle performance).
         """
         cfg = self.config
         M = cfg.filter_length
 
-        gain_t = _ou_process(n, nom_gain, gain_sigma, cfg.thermal_timescale, cfg.fs, self.rng)
-        freq_t = _ou_process(n, nom_freq, freq_sigma, cfg.thermal_timescale, cfg.fs, self.rng)
-        gain_t = np.clip(gain_t, 0.3, 5.0)
-        # Lower bound: half the nominal frequency (prevents unphysical near-DC resonance).
-        # Upper bound: Nyquist/2 = fs/4.  The previous lower bound of 0.5 was wrong for
-        # the seismic model where nom_freq=0.2 Hz — it clipped every sample to 0.5 Hz,
-        # eliminating all frequency drift and misplacing the resonance outside the
-        # microseismic band.
-        freq_t = np.clip(freq_t, max(0.02, nom_freq * 0.5), cfg.fs / 4.0)
+        if cfg.drift:
+            gain_t = _ou_process(n, nom_gain, gain_sigma, cfg.thermal_timescale, cfg.fs, self.rng)
+            freq_t = _ou_process(n, nom_freq, freq_sigma, cfg.thermal_timescale, cfg.fs, self.rng)
+            gain_t = np.clip(gain_t, 0.3, 5.0)
+            freq_t = np.clip(freq_t, max(0.02, nom_freq * 0.5), cfg.fs / 4.0)
+        else:
+            # Stationary coupling: fixed nominal filter throughout the episode
+            gain_t = np.full(n, nom_gain)
+            freq_t = np.full(n, nom_freq)
 
         coupling = np.zeros(n)
         for i in range(M, n):
@@ -442,62 +479,62 @@ class SeismicSignalSimulator:
             coupling[i] = np.dot(filters[schedule[i]], witness[i - M:i][::-1])
         return coupling, schedule
 
-    def _tilt_to_length_coupling(
-        self, w1: np.ndarray, w2: np.ndarray, n: int
+    def _tilt_horizontal_coupling(
+        self, witness_y: np.ndarray, n: int
     ) -> np.ndarray:
         """
-        Bilinear tilt-to-length (T2L) cross-coupling:
+        Tilt-horizontal coupling from Y-direction seismic to main channel:
 
-            C_T2L(t) = T(t) · θ_proxy(t) · w1(t)
+            C_tilt(t) = T(t) · θ_y_proxy(t)
 
         Physical mechanism
         ------------------
-        For Rayleigh waves, ground tilt θ is proportional to the temporal
-        derivative of vertical displacement:
+        Rayleigh waves propagating along Y tilt the ground about the X axis.
+        For a Rayleigh wave with phase velocity c_R, the tilt angle is:
 
-            θ(ω) = (ω / c_R) · v_z(ω)   →   θ ≈ (1/c_R) · dv_z/dt
+            θ_y(ω) = (ω / c_R) · w_y(ω)   →   θ_y ≈ (1/c_R) · dw_y/dt
 
-        In the time domain this is a first-difference (highpass) FIR applied
-        to the vertical seismometer w2:
+        In the time domain this is approximated by a first-difference FIR:
 
-            θ_proxy[t] = w2[t] − w2[t−1]         (normalised)
+            θ_y_proxy[t] = w_y[t] − w_y[t−1]    (normalised to unit RMS)
 
-        θ then couples bilinearly with the horizontal motion w1 into the main
-        channel via the pendulum + mirror-alignment mechanism.  T(t) is the
-        alignment-dependent T2L gain, which drifts on the timescale of mirror
-        angular control corrections (typically tens of minutes to hours).
+        The tilt θ_y couples into the main channel via the alignment-dependent
+        gain T(t), representing the mechanical lever arm between mirror tilt
+        and length noise (controlled by mirror angular alignment):
 
-        Why linear filters fail
-        -----------------------
-        C_T2L is the point-wise product of θ_proxy (a function of w2) and w1.
-        No linear combination of w1 and w2 can represent a product — the
-        Volterra kernel has support off the diagonal.  The NLMS floor is:
+            C_tilt(t) = T(t) · θ_y_proxy(t)
 
-            residual_floor ≥ sqrt(rms(C_T2L)² + oracle²)
+        When config.drift=True, T(t) follows an Ornstein–Uhlenbeck process
+        (mean = t2l_gain, σ = t2l_gain_drift_sigma), representing slow
+        changes in mirror alignment.  Any static linear filter applied to
+        witness_y must re-adapt as T drifts.
 
-        An RL agent that learns to multiply θ_proxy by w1 can cancel C_T2L
-        and approach the oracle floor.
+        When config.drift=False, T(t) = t2l_gain (constant).  A static
+        linear filter can then perfectly cancel C_tilt once converged.
         """
         cfg = self.config
 
-        # --- tilt proxy: first-difference of vertical seismometer ---
+        # --- tilt proxy: first-difference of Y seismometer (∝ dw_y/dt) ---
         tilt_proxy = np.empty(n)
         tilt_proxy[0] = 0.0
-        tilt_proxy[1:] = w2[1:] - w2[:-1]
+        tilt_proxy[1:] = witness_y[1:] - witness_y[:-1]
         rms_tilt = float(np.sqrt(np.mean(tilt_proxy[1:]**2))) + 1e-12
         tilt_proxy /= rms_tilt
 
-        # --- OU-drifting T2L gain (alignment-dependent) ---
-        T_gain = _ou_process(
-            n,
-            mean=cfg.t2l_gain,
-            sigma=cfg.t2l_gain_drift_sigma,
-            timescale=cfg.t2l_thermal_timescale,
-            fs=cfg.fs,
-            rng=self.rng,
-        )
-        T_gain = np.clip(T_gain, 0.05, cfg.t2l_gain * 2.5)
+        # --- T(t): alignment-dependent coupling gain (drifts or fixed) ---
+        if cfg.drift:
+            T_gain = _ou_process(
+                n,
+                mean=cfg.t2l_gain,
+                sigma=cfg.t2l_gain_drift_sigma,
+                timescale=cfg.t2l_thermal_timescale,
+                fs=cfg.fs,
+                rng=self.rng,
+            )
+            T_gain = np.clip(T_gain, 0.05, cfg.t2l_gain * 2.5)
+        else:
+            # Stationary: constant coupling gain (linear filter can cancel)
+            T_gain = np.full(n, cfg.t2l_gain)
 
-        # --- bilinear product ---
-        rms_w1 = float(np.sqrt(np.mean(w1**2))) + 1e-12
-        return T_gain * tilt_proxy * (w1 / rms_w1)
+        # --- tilt-horizontal coupling: C_tilt = T(t) · θ_y_proxy(t) ---
+        return T_gain * tilt_proxy
