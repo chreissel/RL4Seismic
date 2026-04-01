@@ -73,8 +73,9 @@ def parse_args():
                         "LSTM policy (RecurrentPPO). Inspired by DeepMind DLS.")
     p.add_argument("--conv-channels", type=int, default=64,
                    help="Number of channels in dilated conv extractor (default: 64)")
-    p.add_argument("--conv-layers", type=int, default=6,
-                   help="Number of dilated conv layers (default: 6, RF=127 samples)")
+    p.add_argument("--conv-layers", type=int, default=8,
+                   help="Number of dilated conv layers (default: 8, RF=511 samples = 127 s @ 4 Hz). "
+                        "Must be ≥7 to cover the 240-sample seismic window.")
     return p.parse_args()
 
 
@@ -129,8 +130,9 @@ def main():
     else:
         print(f"  Reward         : broadband squared-error improvement")
     if args.dilated_conv:
+        rf = 1 + 2 * (2 ** args.conv_layers - 1)
         print(f"  Policy         : dilated causal conv ({args.conv_layers} layers, "
-              f"{args.conv_channels} channels)")
+              f"{args.conv_channels} ch, RF={rf} samples = {rf/config.fs:.0f} s)")
     else:
         print(f"  Policy         : LSTM (RecurrentPPO, hidden=256)")
     print("=" * 60)
@@ -161,7 +163,7 @@ def main():
             batch_size=256,
             n_epochs=10,
             learning_rate=3e-4,
-            gamma=0.99,
+            gamma=0.999,   # 250 s horizon at 4 Hz; 0.99 (25 s) is too short vs OU timescale 600 s
             gae_lambda=0.95,
             clip_range=0.2,
             ent_coef=1e-3,
@@ -177,7 +179,7 @@ def main():
             batch_size=256,
             n_epochs=10,
             learning_rate=3e-4,
-            gamma=0.99,
+            gamma=0.999,   # 250 s horizon at 4 Hz; 0.99 (25 s) is too short vs OU timescale 600 s
             gae_lambda=0.95,
             clip_range=0.1,
             ent_coef=1e-4,

@@ -33,11 +33,17 @@ Regime changes (regime_changes=True):
     Coupling path jumps between K discrete FIR filters at Poisson-distributed
     times, representing sudden coupling path changes (lock-loss, alignment jump).
 
-Defaults are aligned with arXiv:2511.19682 (Reissel et al., 2025):
+Signal processing parameters follow arXiv:2511.19682 (Reissel et al., 2025):
   - 4 Hz sampling rate (matching their downsampled data stream)
   - 0.1–0.3 Hz microseismic band (ocean-wave-generated noise)
   - 240-tap FIR = 60 s context (matching their LSTM input window)
-  - Thermal timescale ~10 min (OU drift of mechanical coupling parameters)
+
+The non-stationarity model (OU drift) is our own synthetic approximation.
+arXiv:2511.19682 trains on real LIGO data, where coupling varies across many
+timescales: slow thermal/alignment drift (minutes–hours), seasonal modulation
+(months), and sudden discontinuities from lock-loss or maintenance.  The OU
+process captures only the slow mean-reverting component; use --regime-changes
+to additionally model sudden coupling path switches.
 """
 
 from __future__ import annotations
@@ -63,11 +69,17 @@ class SeismicConfig:
     where h(t) is a slowly drifting resonant FIR coupling filter and
     w(t) is broadband seismic ground motion.
 
-    Defaults are aligned with arXiv:2511.19682 (Reissel et al., 2025):
+    Signal processing parameters follow arXiv:2511.19682 (Reissel et al., 2025):
       - 4 Hz sampling rate (matching their downsampled data stream)
       - 0.1–0.3 Hz microseismic band (ocean-wave-generated noise)
       - 240-tap FIR = 60 s context (matching their LSTM input window)
-      - Thermal timescale ~10 min (OU drift of mechanical coupling parameters)
+
+    The OU drift model is a synthetic approximation of physical non-stationarity.
+    Real LIGO coupling varies across many timescales simultaneously (minutes–hours
+    for thermal/alignment drift, months for seasonal microseism modulation, plus
+    sudden discontinuities from lock-loss and maintenance).  The OU process here
+    captures only the slow mean-reverting component; --regime-changes adds sudden
+    coupling path switches on top.
     """
 
     # --- sampling ---
@@ -111,8 +123,12 @@ class SeismicConfig:
     # and T(t) is an OU-drifting alignment-dependent coupling gain.
     # This is the dominant nonlinearity identified in arXiv:2511.19682.
     tilt_coupling: bool = False
-    t2l_gain: float = 0.8               # nominal T2L coupling gain
-    t2l_gain_drift_sigma: float = 0.2   # OU fluctuation of T2L gain
+    t2l_gain: float = 3.0               # nominal T2L coupling gain.
+                                        # Set so T2L RMS > NLMS linear residual after the
+                                        # clip-fix: T2L ~3.1 RMS vs NLMS-linear ~2.5 RMS,
+                                        # making T2L the dominant residual for linear methods
+                                        # and the primary reason RL can outperform them.
+    t2l_gain_drift_sigma: float = 0.3   # OU fluctuation of T2L gain (scaled with larger mean)
     t2l_thermal_timescale: float = 600.0  # seconds — alignment changes slowly
 
 
@@ -347,7 +363,12 @@ class SeismicSignalSimulator:
         gain_t = _ou_process(n, nom_gain, gain_sigma, cfg.thermal_timescale, cfg.fs, self.rng)
         freq_t = _ou_process(n, nom_freq, freq_sigma, cfg.thermal_timescale, cfg.fs, self.rng)
         gain_t = np.clip(gain_t, 0.3, 5.0)
-        freq_t = np.clip(freq_t, 0.5, cfg.fs / 4.0)
+        # Lower bound: half the nominal frequency (prevents unphysical near-DC resonance).
+        # Upper bound: Nyquist/2 = fs/4.  The previous lower bound of 0.5 was wrong for
+        # the seismic model where nom_freq=0.2 Hz — it clipped every sample to 0.5 Hz,
+        # eliminating all frequency drift and misplacing the resonance outside the
+        # microseismic band.
+        freq_t = np.clip(freq_t, max(0.02, nom_freq * 0.5), cfg.fs / 4.0)
 
         coupling = np.zeros(n)
         for i in range(M, n):
