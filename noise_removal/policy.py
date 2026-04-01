@@ -28,7 +28,10 @@ This covers the full 240-sample (60 s) seismic observation window with margin.
 6 layers (RF=127) is insufficient for the seismic model — use ≥7 layers.
 
 The extractor reshapes the flat observation vector into (n_channels, window_size)
-before applying the convolutions, then global-average-pools over time.
+before applying the convolutions, then takes the last-timestep features.
+Using the last timestep (rather than global avg pool) preserves exact current-time
+values (w1[t], tilt_proxy[t]) needed for T2L bilinear cancellation, while the
+dilated conv stack still provides full 511-sample context via its receptive field.
 
 Usage
 -----
@@ -116,7 +119,14 @@ class DilatedCausalConvExtractor(BaseFeaturesExtractor):
             for i in range(n_layers)
         ])
 
-        # Global average pooling + linear projection to features_dim
+        # Project last-timestep features to features_dim.
+        # We take x[:, :, -1] (the causally-computed features at the current
+        # timestep) rather than global-average-pooling over time.  Global avg
+        # pool dilutes the current-sample values (w1[t], tilt_proxy[t]) with
+        # all 240 past steps, destroying the precise current-time signal the
+        # agent needs to compute T_gain(t) × tilt_proxy(t) × w1(t) for T2L
+        # cancellation.  The last position already encodes full context via
+        # the 511-sample dilated-conv receptive field, so no context is lost.
         self.output_proj = nn.Linear(conv_channels, features_dim)
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
@@ -129,6 +139,6 @@ class DilatedCausalConvExtractor(BaseFeaturesExtractor):
         for layer in self.layers:
             x = layer(x)               # (batch, conv_channels, window_size)
 
-        # Global average pool over time → (batch, conv_channels)
-        x = x.mean(dim=2)
+        # Take last timestep (current time, causally conditioned on full RF)
+        x = x[:, :, -1]              # (batch, conv_channels)
         return F.gelu(self.output_proj(x))  # (batch, features_dim)
