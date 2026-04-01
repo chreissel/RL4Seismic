@@ -4,10 +4,11 @@ and compare against classical adaptive filter baselines.
 
 Usage
 -----
-    python evaluate.py                            # use saved model
+    python evaluate.py                            # use saved model (tilt coupling on by default)
     python evaluate.py --model-path models/ppo_noise_cancellation
     python evaluate.py --no-model                 # skip RL, compare baselines only
-    python evaluate.py --multi-source --tilt-coupling
+    python evaluate.py --no-tilt-coupling         # X coupling only (easier baseline)
+    python evaluate.py --no-drift                 # disable OU drift (stationary system)
     python evaluate.py --no-lstm --no-model       # fastest: baselines only
 
 Produces
@@ -54,8 +55,7 @@ def run_lms(
     step_size: float = 0.1,
 ) -> np.ndarray:
     filt = LMSFilter(filter_length=filter_length, step_size=step_size, normalized=True)
-    w2 = data.get("witness2")
-    return filt.run(data["witness"], data["main"], witness2=w2)
+    return filt.run(data["witness_x"], data["main"], witness_y=data["witness_y"])
 
 
 def run_iir(
@@ -71,8 +71,7 @@ def run_iir(
         step_size=step_size,
         normalized=True,
     )
-    w2 = data.get("witness2")
-    return filt.run(data["witness"], data["main"], witness2=w2)
+    return filt.run(data["witness_x"], data["main"], witness_y=data["witness_y"])
 
 
 def run_supervised_lstm(
@@ -100,8 +99,7 @@ def run_supervised_lstm(
         print(f"  Training supervised LSTM ({n_epochs} epochs)…")
     lstm.fit(train_data, verbose=verbose)
 
-    w2 = eval_data.get("witness2")
-    return lstm.run(eval_data["witness"], eval_data["main"], witness2=w2)
+    return lstm.run(eval_data["witness_x"], eval_data["main"], witness_y=eval_data["witness_y"])
 
 
 def run_rl_agent(
@@ -188,13 +186,14 @@ def plot_overview(
 
     # ---- Top panel: coupling waveform ----
     ax0 = fig.add_subplot(gs[0, :])
-    ax0.plot(t, data["coupling"], lw=0.7, alpha=0.8, label="Coupling h(t)⊛w(t)", color="tab:blue")
-    ax0.plot(t, data["witness"], lw=0.6, alpha=0.5, label="Witness w(t)", color="tab:orange")
-    if "coupling_t2l" in data:
-        ax0.plot(t, data["coupling_t2l"], lw=0.6, alpha=0.7, label="T2L term", color="tab:red")
+    ax0.plot(t, data["coupling"], lw=0.7, alpha=0.8, label="Total coupling", color="tab:blue")
+    ax0.plot(t, data["witness_x"], lw=0.6, alpha=0.5, label="Witness X (inline)", color="tab:orange")
+    ax0.plot(t, data["witness_y"], lw=0.6, alpha=0.4, label="Witness Y (perpendicular)", color="tab:green")
+    if "coupling_tilt" in data:
+        ax0.plot(t, data["coupling_tilt"], lw=0.6, alpha=0.7, label="Tilt-horizontal term C_tilt(t)", color="tab:red")
     ax0.set_xlabel("Time (s)")
     ax0.set_ylabel("Amplitude")
-    ax0.set_title("Seismic coupling: y(t) = h(t) ⊛ w(t) + n(t)")
+    ax0.set_title("Seismic coupling: y(t) = h_x(t)⊛w_x(t) + C_tilt(t) + n_GS13X(t)")
     ax0.legend(loc="upper right", fontsize=9)
     ax0.grid(alpha=0.3)
 
@@ -298,12 +297,12 @@ def print_metrics(data, lms_clean, iir_clean, rl_clean, lstm_clean=None):
     print("  Performance summary")
     print("=" * 60)
     print(f"  Oracle (sensor noise floor)   : {oracle_rms:.4f}")
-    if "coupling_t2l" in data:
-        t2l_rms = rms(data["coupling_t2l"])
-        linear_floor = float(np.sqrt(t2l_rms**2 + oracle_rms**2))
-        print(f"  T2L bilinear term             : {t2l_rms:.4f}")
-        print(f"  Linear filter floor           : {linear_floor:.4f}"
-              f"  ({linear_floor/oracle_rms:.1f}× oracle)  ← NLMS cannot beat this")
+    if "coupling_tilt" in data:
+        tilt_rms = rms(data["coupling_tilt"])
+        linear_floor = float(np.sqrt(tilt_rms**2 + oracle_rms**2))
+        print(f"  Tilt-horizontal coupling      : {tilt_rms:.4f}")
+        print(f"  Linear filter floor (w/ drift): {linear_floor:.4f}"
+              f"  ({linear_floor/oracle_rms:.1f}× oracle)  ← static NLMS cannot beat this")
     print(f"  Raw main channel              : {raw_rms:.4f}  ({raw_rms/oracle_rms:.1f}× oracle)")
     print(f"  NLMS filter                   : {lms_rms:.4f}  ({lms_rms/oracle_rms:.1f}× oracle)")
     print(f"  IIR adaptive filter           : {iir_rms:.4f}  ({iir_rms/oracle_rms:.1f}× oracle)")
@@ -313,8 +312,8 @@ def print_metrics(data, lms_clean, iir_clean, rl_clean, lstm_clean=None):
     if rl_clean is not None:
         rl_rms = rms(rl_clean)
         beats = ""
-        if "coupling_t2l" in data:
-            linear_floor = float(np.sqrt(rms(data["coupling_t2l"])**2 + oracle_rms**2))
+        if "coupling_tilt" in data:
+            linear_floor = float(np.sqrt(rms(data["coupling_tilt"])**2 + oracle_rms**2))
             if rl_rms < linear_floor:
                 beats = " *** BEATS LINEAR FLOOR ***"
         print(f"  RL agent (RecurrentPPO)       : {rl_rms:.4f}  ({rl_rms/oracle_rms:.1f}× oracle){beats}")
@@ -339,13 +338,16 @@ def parse_args():
                         "(default: 3× eval duration)")
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--save-dir", default="results")
-    p.add_argument("--multi-source", action="store_true",
-                   help="Evaluate with second seismometer channel")
+    p.add_argument("--no-drift", action="store_true",
+                   help="Disable OU drift of coupling parameters (stationary system; "
+                        "linear baselines should reach near-oracle performance)")
     p.add_argument("--regime-changes", action="store_true",
                    help="Evaluate with piecewise-constant coupling regime switches")
-    p.add_argument("--tilt-coupling", action="store_true",
-                   help="Add bilinear tilt-to-length cross-coupling "
-                        "(requires --multi-source): C_T2L = T(t)·θ(t)·w1(t)")
+    p.add_argument("--tilt-coupling", action="store_true", default=True,
+                   help="Include tilt-horizontal coupling from Y seismic channel "
+                        "(default: on). C_tilt(t) = T(t)·θ_y_proxy(t)")
+    p.add_argument("--no-tilt-coupling", action="store_true",
+                   help="Disable tilt-horizontal coupling (X coupling only)")
     p.add_argument("--no-lstm", action="store_true",
                    help="Skip supervised LSTM baseline (faster evaluation)")
     p.add_argument("--lstm-epochs", type=int, default=30,
@@ -359,9 +361,9 @@ def main():
     args = parse_args()
 
     cfg = SeismicConfig(
-        multi_source=args.multi_source,
+        drift=not args.no_drift,
         regime_changes=args.regime_changes,
-        tilt_coupling=args.tilt_coupling,
+        tilt_coupling=not args.no_tilt_coupling,
     )
 
     window_size = args.window_size if args.window_size is not None else cfg.filter_length

@@ -63,24 +63,23 @@ class IIRFilter:
         self._residual_buf[:] = 0.0
 
     def update(
-        self, witness_sample: float, main_sample: float, w2_sample: float = 0.0
+        self, witness_x_sample: float, main_sample: float, witness_y_sample: float = 0.0
     ) -> float:
         """
         Process one sample and return the cleaned main-channel value.
 
         Parameters
         ----------
-        witness_sample : current witness channel 1 sample
-        main_sample    : current main channel sample
-        w2_sample      : current witness channel 2 sample (used only when
-                         the filter was initialised with two-channel buffers)
+        witness_x_sample : current witness X (inline) channel sample
+        main_sample      : current main (obtaining) channel sample
+        witness_y_sample : current witness Y (perpendicular) channel sample (optional)
 
         Returns
         -------
         residual : main_sample minus the IIR coupling estimate
         """
         self._witness_buf = np.roll(self._witness_buf, 1)
-        self._witness_buf[0] = witness_sample
+        self._witness_buf[0] = witness_x_sample
 
         coupling_estimate = float(self.b @ self._witness_buf)
         if self.N > 0:
@@ -105,24 +104,27 @@ class IIRFilter:
         return residual
 
     def run(
-        self, witness: np.ndarray, main: np.ndarray, witness2: Optional[np.ndarray] = None
+        self,
+        witness_x: np.ndarray,
+        main: np.ndarray,
+        witness_y: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
         Process full arrays of data (online, sample by sample).
 
         Parameters
         ----------
-        witness  : (N,) witness channel 1
-        main     : (N,) main channel
-        witness2 : (N,) witness channel 2 (optional).  When provided the
-                   feedforward length is doubled to 2·M so both channels
-                   are used as separate inputs (no cross-term product).
+        witness_x : (N,) witness X channel (inline, translational)
+        main      : (N,) main (obtaining) channel
+        witness_y : (N,) witness Y channel (perpendicular, tilt source).
+                    When provided the feedforward length is doubled to 2·M
+                    so both channels are used as separate linear inputs.
 
         Returns
         -------
         cleaned : (N,) main channel after IIR subtraction
         """
-        if witness2 is not None:
+        if witness_y is not None:
             # Two-channel: doubled feedforward buffer, always NLMS for stability.
             M2 = 2 * self.M
             b2 = np.zeros(M2)
@@ -134,8 +136,8 @@ class IIRFilter:
             cleaned = np.empty(N)
             for i in range(N):
                 w_buf = np.roll(w_buf, 1)
-                w_buf[0]      = float(witness[i])
-                w_buf[self.M] = float(witness2[i])
+                w_buf[0]      = float(witness_x[i])
+                w_buf[self.M] = float(witness_y[i])
                 coupling_estimate = float(b2 @ w_buf)
                 if self.N > 0:
                     r_buf = np.roll(r_buf, 1)
@@ -154,5 +156,5 @@ class IIRFilter:
         N = len(main)
         cleaned = np.empty(N)
         for i in range(N):
-            cleaned[i] = self.update(float(witness[i]), float(main[i]))
+            cleaned[i] = self.update(float(witness_x[i]), float(main[i]))
         return cleaned

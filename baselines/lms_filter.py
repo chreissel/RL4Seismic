@@ -63,23 +63,23 @@ class LMSFilter:
         self._witness_buf[:] = 0.0
 
     def update(
-        self, witness_sample: float, main_sample: float, w2_sample: float = 0.0
+        self, witness_x_sample: float, main_sample: float, witness_y_sample: float = 0.0
     ) -> float:
         """
         Process one sample and return the cleaned main-channel value.
 
         Parameters
         ----------
-        witness_sample : current witness channel 1 sample
-        main_sample    : current main channel sample
-        w2_sample      : current witness channel 2 sample (optional, default 0)
+        witness_x_sample : current witness X (inline) channel sample
+        main_sample      : current main (obtaining) channel sample
+        witness_y_sample : current witness Y (perpendicular) channel sample (optional, default 0)
 
         Returns
         -------
         main_clean : main_sample minus the linear coupling estimate
         """
         self._witness_buf = np.roll(self._witness_buf, 1)
-        self._witness_buf[0] = witness_sample
+        self._witness_buf[0] = witness_x_sample
 
         coupling_estimate = float(self.weights @ self._witness_buf)
         residual = main_sample - coupling_estimate
@@ -93,24 +93,30 @@ class LMSFilter:
         return residual
 
     def run(
-        self, witness: np.ndarray, main: np.ndarray, witness2: Optional[np.ndarray] = None
+        self,
+        witness_x: np.ndarray,
+        main: np.ndarray,
+        witness_y: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
         Process full arrays of data (online, sample by sample).
 
         Parameters
         ----------
-        witness  : (N,) witness channel 1
-        main     : (N,) main channel
-        witness2 : (N,) witness channel 2 (optional).  When provided the
-                   filter length is doubled to 2·M and both channels are
-                   used as separate inputs (no cross-term product).
+        witness_x : (N,) witness X channel (inline, translational)
+        main      : (N,) main (obtaining) channel
+        witness_y : (N,) witness Y channel (perpendicular, tilt source).
+                    When provided the filter length is doubled to 2·M and
+                    both channels are concatenated as separate linear inputs.
+                    Note: this linear filter cannot cancel the tilt-horizontal
+                    coupling when T(t) drifts, but can approximate it when
+                    T is nearly constant.
 
         Returns
         -------
         cleaned : (N,) main channel after LMS subtraction
         """
-        if witness2 is not None:
+        if witness_y is not None:
             M2 = 2 * self.M
             weights2 = np.zeros(M2)
             buf2 = np.zeros(M2)
@@ -120,8 +126,8 @@ class LMSFilter:
             eps = self._eps
             for i in range(N):
                 buf2 = np.roll(buf2, 1)
-                buf2[0] = float(witness[i])
-                buf2[self.M] = float(witness2[i])
+                buf2[0] = float(witness_x[i])
+                buf2[self.M] = float(witness_y[i])
                 coupling_estimate = float(weights2 @ buf2)
                 residual = float(main[i]) - coupling_estimate
                 if self.normalized:
@@ -136,5 +142,5 @@ class LMSFilter:
         N = len(main)
         cleaned = np.empty(N)
         for i in range(N):
-            cleaned[i] = self.update(float(witness[i]), float(main[i]))
+            cleaned[i] = self.update(float(witness_x[i]), float(main[i]))
         return cleaned
