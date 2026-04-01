@@ -94,8 +94,8 @@ class SeismicConfig:
     coupling_gain: float = 0.5          # nominal coupling RMS gain (reduced from 2.0 so
                                         # NLMS converges quickly to its linear floor,
                                         # cleanly exposing the T2L residual)
-    resonance_freq: float = 0.2         # Hz  — microseismic band (0.1–0.3 Hz)
-    resonance_q: float = 5.0            # quality factor Q = f_r / bandwidth
+    resonance_freq: float = 0.14        # Hz  — secondary microseism peak (7 s period)
+    resonance_q: float = 8.0            # quality factor Q = f_r / bandwidth (sharper)
 
     # --- thermal / alignment drift (Ornstein–Uhlenbeck) ---
     thermal_timescale: float = 600.0    # seconds  (≈ 10 min thermal time const.)
@@ -114,7 +114,7 @@ class SeismicConfig:
     # --- multi-source (second seismometer / rotational DOF) ---
     # Mirrors the paper's multi-DOF setup where translational and rotational
     # channels couple nonlinearly (tilt-to-length mechanism).
-    multi_source: bool = False
+    multi_source: bool = True
     w2_coupling_gain: float = 0.4       # reduced from 1.5 (matches coupling_gain reduction)
     w2_resonance_freq: float = 0.35     # Hz  — slightly different resonance
     w2_resonance_q: float = 4.0
@@ -127,13 +127,13 @@ class SeismicConfig:
     # This is the dominant nonlinearity identified in arXiv:2511.19682.
     #
     # With coupling_gain=0.5, NLMS converges to a linear residual RMS of ~0.1-0.3.
-    # T2L RMS ≈ t2l_gain = 5.0, so T2L accounts for >99% of the residual floor:
-    #   T2L fraction = 5.0² / (5.0² + 0.05²) ≈ 99.99%
+    # T2L RMS ≈ t2l_gain = 8.0, so T2L accounts for >99.99% of the residual floor:
+    #   T2L fraction = 8.0² / (8.0² + 0.05²) ≈ 99.998%
     # This makes the nonlinear floor unambiguous, and the RL improvement clear.
-    tilt_coupling: bool = False
-    t2l_gain: float = 5.0               # increased from 3.0 — T2L RMS ≈ 5.0,
+    tilt_coupling: bool = True
+    t2l_gain: float = 8.0               # T2L RMS ≈ 8.0, linear floor ≈ 160× oracle
                                         # clearly dominant over NLMS linear floor (~0.3)
-                                        # T_gain clipped at 5.0 × 2.5 = 12.5 → peak T2L ≈ 37
+                                        # T_gain clipped at 8.0 × 2.5 = 20.0 → peak T2L ≈ 60
     t2l_gain_drift_sigma: float = 0.5   # OU fluctuation of T2L gain
     t2l_thermal_timescale: float = 600.0  # seconds — alignment changes slowly
 
@@ -200,23 +200,45 @@ def _seismic_ground_motion(
     n: int, amplitude: float, fs: float, rng: np.random.Generator
 ) -> np.ndarray:
     """
-    Broadband coloured noise approximating a seismic ground-motion spectrum.
+    Coloured noise approximating the Peterson NLNM seismic ground-motion
+    spectrum as seen in downsampled LIGO data (arXiv:2511.19682).
 
-    Method: integrate white noise (→ 1/f² brownian PSD), then bandpass
-    [0.05–1.5 Hz].  This captures the dominant energy at low frequencies
-    while avoiding DC drift and aliasing.
+    Method:
+      1. 1/f² Brownian background (integrate white noise once).
+      2. Resonant secondary microseism peak at ~0.14 Hz (7 s ocean period),
+         the dominant spectral feature in the LIGO microseismic band.
+      3. Mix both components, then bandpass [0.05–0.5 Hz] — matching the
+         paper's 4 Hz downsampled stream where the anti-aliasing filter
+         kills energy above ~0.5 Hz.
 
+    The double-hump structure (primary ~0.07 Hz, secondary ~0.14 Hz) of the
+    Peterson NLNM is approximated by the Brownian floor + the resonant peak.
     The result is normalised to RMS = amplitude.
     """
     extra = min(512, n // 2)  # discard filter transient
-    white = rng.normal(0.0, 1.0, n + extra)
-    brown = np.cumsum(white) / np.sqrt(n + extra)
+    N = n + extra
+    white = rng.normal(0.0, 1.0, N)
 
-    # Target microseismic band (0.05–1.5 Hz), clamped to Nyquist
-    f_low  = max(0.02, 0.05) / (fs / 2.0)
-    f_high = min(1.5, fs * 0.45) / (fs / 2.0)
-    sos = butter(4, [f_low, f_high], btype="band", output="sos")
-    filtered = sosfilt(sos, brown)[extra:]
+    # Component 1: 1/f² Brownian background (low-freq energy floor)
+    brown = np.cumsum(white) / np.sqrt(N)
+
+    # Component 2: secondary microseism peak (~0.14 Hz, bandwidth ±0.04 Hz)
+    # This is the dominant spectral feature in real LIGO seismic data.
+    f_mic  = 0.14  # Hz — secondary microseism (7 s ocean period)
+    bw_mic = 0.08  # Hz — peak width
+    f_lo   = max(f_mic - bw_mic / 2, 0.02) / (fs / 2.0)
+    f_hi   = min(f_mic + bw_mic / 2, fs * 0.45) / (fs / 2.0)
+    sos_mic = butter(3, [f_lo, f_hi], btype="band", output="sos")
+    peak_sec = sosfilt(sos_mic, white)
+
+    # Mix: Brownian floor + dominant microseismic peak (2× weight)
+    mixed = brown + 2.0 * peak_sec
+
+    # Final bandpass: 0.05–0.5 Hz (matches paper's anti-aliased 4 Hz stream)
+    f_low  = 0.05 / (fs / 2.0)
+    f_high = min(0.5, fs * 0.45) / (fs / 2.0)
+    sos_bp = butter(4, [f_low, f_high], btype="band", output="sos")
+    filtered = sosfilt(sos_bp, mixed)[extra:]
 
     rms_val = np.sqrt(np.mean(filtered**2))
     return amplitude * filtered / (rms_val + 1e-12)
