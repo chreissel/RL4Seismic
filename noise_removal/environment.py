@@ -52,7 +52,7 @@ class NoiseCancellationEnv(gym.Env):
     config           : SeismicConfig (set config.multi_source=True for two channels)
     window_size      : W — observation window length in samples
     episode_duration : episode length in seconds
-    action_clip      : symmetric bound on the action space (default 25.0)
+    action_clip      : symmetric bound on the action space (default 40.0)
     freq_reward      : if True, compute reward on band-limited residual only
     freq_band_low    : lower edge of reward band in Hz (default 0.05 Hz)
     freq_band_high   : upper edge of reward band in Hz (default 1.5 Hz)
@@ -65,7 +65,7 @@ class NoiseCancellationEnv(gym.Env):
         config: Optional[SeismicConfig] = None,
         window_size: int = 240,
         episode_duration: float = 300.0,
-        action_clip: float = 25.0,   # raised from 15: coupling peaks reach ~25–40 with T2L
+        action_clip: float = 40.0,   # t2l_gain=5.0 → T_gain_max=12.5, peak T2L ≈ 37; +3 linear
         freq_reward: bool = False,
         freq_band_low: float = 0.05,
         freq_band_high: float = 1.5,
