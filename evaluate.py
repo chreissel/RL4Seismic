@@ -53,15 +53,18 @@ def run_lms(
     data: dict,
     filter_length: int = 240,
     step_size: float = 0.1,
+    use_witness_y: bool = True,
 ) -> np.ndarray:
     filt = LMSFilter(filter_length=filter_length, step_size=step_size, normalized=True)
-    return filt.run(data["witness_x"], data["main"], witness_y=data["witness_y"])
+    wy = data["witness_y"] if use_witness_y else None
+    return filt.run(data["witness_x"], data["main"], witness_y=wy)
 
 
 def run_iir(
     data: dict,
     feedforward_length: int = 240,
     step_size: float = 0.1,
+    use_witness_y: bool = True,
 ) -> np.ndarray:
     # feedback_length=0: the seismic coupling is purely FIR; non-zero feedback
     # on coloured seismic signals leads to equation-error instability.
@@ -71,7 +74,8 @@ def run_iir(
         step_size=step_size,
         normalized=True,
     )
-    return filt.run(data["witness_x"], data["main"], witness_y=data["witness_y"])
+    wy = data["witness_y"] if use_witness_y else None
+    return filt.run(data["witness_x"], data["main"], witness_y=wy)
 
 
 def run_supervised_lstm(
@@ -287,15 +291,31 @@ def plot_overview(
     plt.close(fig)
 
 
-def print_metrics(data, lms_clean, iir_clean, rl_clean, lstm_clean=None):
+def print_metrics(data, lms_clean, iir_clean, rl_clean, lstm_clean=None,
+                  warmup_fraction: float = 0.25):
+    """Print RMS metrics for all methods.
+
+    Reports both full-episode and steady-state (after warmup) performance.
+    Adaptive filters need time to converge; the steady-state metric excludes
+    the initial convergence transient (first ``warmup_fraction`` of the episode).
+    """
     oracle_rms = rms(data["sensor_noise"])
     raw_rms    = rms(data["main"])
     lms_rms    = rms(lms_clean)
     iir_rms    = rms(iir_clean)
 
-    print("\n" + "=" * 60)
+    n = len(data["main"])
+    ss = int(n * warmup_fraction)  # steady-state start index
+    oracle_ss = rms(data["sensor_noise"][ss:])
+    lms_ss    = rms(lms_clean[ss:])
+    iir_ss    = rms(iir_clean[ss:])
+
+    print("\n" + "=" * 72)
     print("  Performance summary")
-    print("=" * 60)
+    print("=" * 72)
+    print(f"  {'Method':<30s}  {'Full episode':>14s}  {'Steady-state':>14s}")
+    print(f"  {'':30s}  {'(×oracle)':>14s}  {'(×oracle, >' + f'{warmup_fraction:.0%})':>14s}")
+    print("-" * 72)
     print(f"  Oracle (sensor noise floor)   : {oracle_rms:.4f}")
     if "coupling_tilt" in data:
         tilt_rms = rms(data["coupling_tilt"])
@@ -303,21 +323,23 @@ def print_metrics(data, lms_clean, iir_clean, rl_clean, lstm_clean=None):
         print(f"  Tilt-horizontal coupling      : {tilt_rms:.4f}")
         print(f"  Linear filter floor (w/ drift): {linear_floor:.4f}"
               f"  ({linear_floor/oracle_rms:.1f}× oracle)  ← static NLMS cannot beat this")
-    print(f"  Raw main channel              : {raw_rms:.4f}  ({raw_rms/oracle_rms:.1f}× oracle)")
-    print(f"  NLMS filter                   : {lms_rms:.4f}  ({lms_rms/oracle_rms:.1f}× oracle)")
-    print(f"  IIR adaptive filter           : {iir_rms:.4f}  ({iir_rms/oracle_rms:.1f}× oracle)")
+    print(f"  Raw main channel              : {raw_rms/oracle_rms:6.1f}×")
+    print(f"  NLMS filter                   : {lms_rms/oracle_rms:6.1f}×{lms_ss/oracle_ss:15.1f}×")
+    print(f"  IIR adaptive filter           : {iir_rms/oracle_rms:6.1f}×{iir_ss/oracle_ss:15.1f}×")
     if lstm_clean is not None:
         lstm_rms = rms(lstm_clean)
-        print(f"  Supervised LSTM               : {lstm_rms:.4f}  ({lstm_rms/oracle_rms:.1f}× oracle)")
+        lstm_ss  = rms(lstm_clean[ss:])
+        print(f"  Supervised LSTM               : {lstm_rms/oracle_rms:6.1f}×{lstm_ss/oracle_ss:15.1f}×")
     if rl_clean is not None:
         rl_rms = rms(rl_clean)
+        rl_ss  = rms(rl_clean[ss:])
         beats = ""
         if "coupling_tilt" in data:
             linear_floor = float(np.sqrt(rms(data["coupling_tilt"])**2 + oracle_rms**2))
             if rl_rms < linear_floor:
                 beats = " *** BEATS LINEAR FLOOR ***"
-        print(f"  RL agent (RecurrentPPO)       : {rl_rms:.4f}  ({rl_rms/oracle_rms:.1f}× oracle){beats}")
-    print("=" * 60)
+        print(f"  RL agent (RecurrentPPO)       : {rl_rms/oracle_rms:6.1f}×{rl_ss/oracle_ss:15.1f}×{beats}")
+    print("=" * 72)
 
 
 # ---------------------------------------------------------------------------
@@ -375,14 +397,21 @@ def main():
     print(f"Generated {args.duration:.0f} s of evaluation data  "
           f"(fs={cfg.fs} Hz, {len(data['time'])} samples)")
 
+    # Only use witness Y for baselines when tilt coupling is active;
+    # otherwise it doubles the filter size (2·M taps) for zero benefit,
+    # drastically slowing convergence.
+    use_wy = cfg.tilt_coupling
+
     # --- NLMS baseline ---
     # Normalised LMS: dimensionless step size (0, 2), stable for coloured
     # seismic signals with large eigenvalue spread.
-    lms_clean = run_lms(data, filter_length=window_size, step_size=0.1)
+    lms_clean = run_lms(data, filter_length=window_size, step_size=0.1,
+                        use_witness_y=use_wy)
     print("NLMS filter done.")
 
     # --- IIR baseline ---
-    iir_clean = run_iir(data, feedforward_length=window_size, step_size=0.1)
+    iir_clean = run_iir(data, feedforward_length=window_size, step_size=0.1,
+                        use_witness_y=use_wy)
     print("IIR filter done.")
 
     # --- Supervised LSTM baseline (paper approach) ---
