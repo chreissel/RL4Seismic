@@ -41,8 +41,8 @@ This tilt couples into the main channel via the alignment-dependent gain T(t):
 
     C_tilt(t) = T(t) · θ_y_proxy(t)
 
-where θ_y_proxy[t] = (w_y[t] − w_y[t−1]) / rms  is a finite-difference
-approximation of dw_y/dt (normalised to unit RMS), and T(t) is the
+where θ_y_proxy[t] = w_y[t] − w_y[t−1]  is a finite-difference
+approximation of dw_y/dt, and T(t) is the
 OU-drifting tilt-horizontal coupling gain representing the slowly changing
 mirror alignment.
 
@@ -153,18 +153,19 @@ class SeismicConfig:
     #
     #   C_tilt(t) = T(t) · θ_y_proxy(t)
     #
-    # where θ_y_proxy[t] = (w_y[t] − w_y[t−1]) / rms  is a normalised first-
-    # difference of the Y seismometer (proxy for dw_y/dt ∝ tilt angle), and
-    # T(t) is the OU-drifting alignment-dependent gain.
+    # where θ_y_proxy[t] = w_y[t] − w_y[t−1] is the first-difference of the
+    # Y seismometer (proxy for dw_y/dt ∝ tilt angle), and T(t) is the
+    # OU-drifting alignment-dependent gain.
     #
     # With drift=True, T(t) is non-stationary (OU), so static linear filters
     # cannot fully cancel C_tilt without re-adapting.  With drift=False, T is
     # constant and a static linear filter CAN cancel C_tilt.
     tilt_coupling: bool = True
-    t2l_gain: float = 8.0               # mean tilt-horizontal coupling gain
-                                         # (T2L RMS ≈ t2l_gain >> linear coupling ≈ 0.5,
-                                         #  making the tilt term the dominant residual floor)
-    t2l_gain_drift_sigma: float = 0.5   # OU fluctuation of T(t)
+    t2l_gain: float = 43.0              # mean tilt-horizontal coupling gain
+                                         # (acts on raw diff(w_y), not normalised;
+                                         #  T2L coupling RMS ≈ t2l_gain × 0.186 ≈ 8.0,
+                                         #  which dominates over linear coupling ≈ 0.5)
+    t2l_gain_drift_sigma: float = 2.7   # OU fluctuation of T(t)
     t2l_thermal_timescale: float = 600.0 # seconds — alignment changes slowly
 
 
@@ -515,11 +516,13 @@ class SeismicSignalSimulator:
         cfg = self.config
 
         # --- tilt proxy: first-difference of Y seismometer (∝ dw_y/dt) ---
+        # No per-episode normalisation: C_tilt = T(t) · diff(w_y) directly.
+        # This ensures the coupling is a deterministic function of witness_y
+        # and the coupling parameters, so offline methods (Wiener filter)
+        # generalise across episodes without gain mismatch.
         tilt_proxy = np.empty(n)
         tilt_proxy[0] = 0.0
         tilt_proxy[1:] = witness_y[1:] - witness_y[:-1]
-        rms_tilt = float(np.sqrt(np.mean(tilt_proxy[1:]**2))) + 1e-12
-        tilt_proxy /= rms_tilt
 
         # --- T(t): alignment-dependent coupling gain (drifts or fixed) ---
         if cfg.drift:
@@ -531,7 +534,7 @@ class SeismicSignalSimulator:
                 fs=cfg.fs,
                 rng=self.rng,
             )
-            T_gain = np.clip(T_gain, 0.05, cfg.t2l_gain * 2.5)
+            T_gain = np.clip(T_gain, 0.5, cfg.t2l_gain * 2.5)
         else:
             # Stationary: constant coupling gain (linear filter can cancel)
             T_gain = np.full(n, cfg.t2l_gain)

@@ -1,6 +1,6 @@
 """
 Evaluate a trained PPO agent on the seismic noise cancellation task
-and compare against classical adaptive filter baselines.
+and compare against classical and learned baselines.
 
 Usage
 -----
@@ -19,8 +19,8 @@ Metrics reported
 ----------------
   RMS of the output signal:
     - No subtraction     (raw main channel)
-    - LMS/NLMS filter    (linear FIR adaptive baseline)
-    - IIR adaptive filter (closed-loop baseline, mirrors RL observation)
+    - Wiener filter      (batch-optimal linear FIR, trained offline)
+    - IIR adaptive filter (online closed-loop baseline)
     - Supervised LSTM    (offline-trained, from arXiv:2511.19682)
     - RL agent (PPO)     (online adaptive, this work)
     - Oracle             (perfect coupling subtraction, sensor noise only)
@@ -38,7 +38,7 @@ import matplotlib.gridspec as gridspec
 from scipy.signal import welch
 
 from noise_removal import NoiseCancellationEnv, SeismicConfig, SeismicSignalSimulator
-from baselines import LMSFilter, IIRFilter, SupervisedLSTM
+from baselines import IIRFilter, SupervisedLSTM, WienerFilter
 
 
 # ---------------------------------------------------------------------------
@@ -49,15 +49,18 @@ def rms(x: np.ndarray) -> float:
     return float(np.sqrt(np.mean(x**2)))
 
 
-def run_lms(
-    data: dict,
+def run_wiener(
+    train_data: dict,
+    eval_data: dict,
     filter_length: int = 240,
-    step_size: float = 0.1,
     use_witness_y: bool = True,
 ) -> np.ndarray:
-    filt = LMSFilter(filter_length=filter_length, step_size=step_size, normalized=True)
-    wy = data["witness_y"] if use_witness_y else None
-    return filt.run(data["witness_x"], data["main"], witness_y=wy)
+    """Train a Wiener filter on *train_data* and apply it to *eval_data*."""
+    wy_train = train_data["witness_y"] if use_witness_y else None
+    wy_eval = eval_data["witness_y"] if use_witness_y else None
+    filt = WienerFilter(filter_length=filter_length)
+    filt.fit(train_data["witness_x"], train_data["main"], witness_y=wy_train)
+    return filt.run(eval_data["witness_x"], eval_data["main"], witness_y=wy_eval)
 
 
 def run_iir(
@@ -174,7 +177,7 @@ def run_rl_agent(
 
 def plot_overview(
     data: dict,
-    lms_clean: np.ndarray,
+    wiener_clean: np.ndarray,
     iir_clean: np.ndarray,
     rl_clean: Optional[np.ndarray],
     save_dir: str,
@@ -205,7 +208,7 @@ def plot_overview(
     mask = t < 30.0
     ax1 = fig.add_subplot(gs[1, 0])
     ax1.plot(t[mask], data["main"][mask], alpha=0.6, lw=0.8, label="Raw", color="grey")
-    ax1.plot(t[mask], lms_clean[mask], alpha=0.8, lw=0.9, label="NLMS", color="tab:orange")
+    ax1.plot(t[mask], wiener_clean[mask], alpha=0.8, lw=0.9, label="Wiener", color="tab:orange")
     ax1.plot(t[mask], iir_clean[mask], alpha=0.8, lw=0.9, label="IIR", color="tab:purple")
     if lstm_clean is not None:
         ax1.plot(t[mask], lstm_clean[mask], alpha=0.9, lw=0.9, label="LSTM (supervised)", color="tab:green")
@@ -222,10 +225,10 @@ def plot_overview(
     ax2 = fig.add_subplot(gs[1, 1])
     nperseg = min(512, len(data["main"]))
     for sig, label, color, lw in [
-        (data["main"], "Raw",    "grey",       1.0),
-        (lms_clean,    "NLMS",   "tab:orange", 1.2),
-        (iir_clean,    "IIR",    "tab:purple", 1.2),
-        (oracle_clean, "Oracle", "tab:red",    1.0),
+        (data["main"],   "Raw",    "grey",       1.0),
+        (wiener_clean,   "Wiener", "tab:orange", 1.2),
+        (iir_clean,      "IIR",    "tab:purple", 1.2),
+        (oracle_clean,   "Oracle", "tab:red",    1.0),
     ]:
         f_psd, pxx = welch(sig, fs=fs, nperseg=nperseg)
         ax2.semilogy(f_psd, pxx, label=label, color=color, lw=lw, alpha=0.8)
@@ -250,7 +253,7 @@ def plot_overview(
             for i in range(len(x))
         ])
     ax3.plot(t, rolling_rms(data["main"]), lw=0.8, label="Raw", color="grey", alpha=0.7)
-    ax3.plot(t, rolling_rms(lms_clean), lw=0.9, label="NLMS", color="tab:orange")
+    ax3.plot(t, rolling_rms(wiener_clean), lw=0.9, label="Wiener", color="tab:orange")
     ax3.plot(t, rolling_rms(iir_clean), lw=0.9, label="IIR", color="tab:purple")
     if lstm_clean is not None:
         ax3.plot(t, rolling_rms(lstm_clean), lw=0.9, label="LSTM (supervised)", color="tab:green")
@@ -265,8 +268,8 @@ def plot_overview(
 
     # ---- Summary bar chart ----
     ax4 = fig.add_subplot(gs[2, 1])
-    labels = ["Raw", "NLMS", "IIR", "Oracle"]
-    values = [rms(data["main"]), rms(lms_clean), rms(iir_clean), rms(oracle_clean)]
+    labels = ["Raw", "Wiener", "IIR", "Oracle"]
+    values = [rms(data["main"]), rms(wiener_clean), rms(iir_clean), rms(oracle_clean)]
     colors = ["grey", "tab:orange", "tab:purple", "tab:red"]
     if lstm_clean is not None:
         labels.insert(3, "LSTM")
@@ -291,45 +294,44 @@ def plot_overview(
     plt.close(fig)
 
 
-def print_metrics(data, lms_clean, iir_clean, rl_clean, lstm_clean=None,
+def print_metrics(data, wiener_clean, iir_clean, rl_clean, lstm_clean=None,
                   warmup_fraction: float = 0.25):
     """Print RMS metrics for all methods.
 
     Reports both full-episode and steady-state (after warmup) performance.
-    Adaptive filters need time to converge; the steady-state metric excludes
-    the initial convergence transient (first ``warmup_fraction`` of the episode).
+    Online adaptive filters (IIR) need time to converge; the steady-state
+    metric excludes the initial convergence transient.  The Wiener filter
+    has no transient (trained offline) so both columns should be similar.
     """
-    oracle_rms = rms(data["sensor_noise"])
-    raw_rms    = rms(data["main"])
-    lms_rms    = rms(lms_clean)
-    iir_rms    = rms(iir_clean)
+    oracle_rms  = rms(data["sensor_noise"])
+    raw_rms     = rms(data["main"])
+    wiener_rms  = rms(wiener_clean)
+    iir_rms     = rms(iir_clean)
 
     n = len(data["main"])
     ss = int(n * warmup_fraction)  # steady-state start index
-    oracle_ss = rms(data["sensor_noise"][ss:])
-    lms_ss    = rms(lms_clean[ss:])
-    iir_ss    = rms(iir_clean[ss:])
+    oracle_ss  = rms(data["sensor_noise"][ss:])
+    wiener_ss  = rms(wiener_clean[ss:])
+    iir_ss     = rms(iir_clean[ss:])
 
     print("\n" + "=" * 72)
     print("  Performance summary")
     print("=" * 72)
     print(f"  {'Method':<30s}  {'Full episode':>14s}  {'Steady-state':>14s}")
-    print(f"  {'':30s}  {'(×oracle)':>14s}  {'(×oracle, >' + f'{warmup_fraction:.0%})':>14s}")
+    print(f"  {'':30s}  {'(x oracle)':>14s}  {'(x oracle, >' + f'{warmup_fraction:.0%})':>14s}")
     print("-" * 72)
     print(f"  Oracle (sensor noise floor)   : {oracle_rms:.4f}")
     if "coupling_tilt" in data:
         tilt_rms = rms(data["coupling_tilt"])
         linear_floor = float(np.sqrt(tilt_rms**2 + oracle_rms**2))
-        print(f"  Tilt-horizontal coupling      : {tilt_rms:.4f}")
-        print(f"  Linear filter floor (w/ drift): {linear_floor:.4f}"
-              f"  ({linear_floor/oracle_rms:.1f}× oracle)  ← static NLMS cannot beat this")
-    print(f"  Raw main channel              : {raw_rms/oracle_rms:6.1f}×")
-    print(f"  NLMS filter                   : {lms_rms/oracle_rms:6.1f}×{lms_ss/oracle_ss:15.1f}×")
-    print(f"  IIR adaptive filter           : {iir_rms/oracle_rms:6.1f}×{iir_ss/oracle_ss:15.1f}×")
+        print(f"  Tilt-horizontal coupling RMS  : {tilt_rms:.4f}  ({tilt_rms/oracle_rms:.1f}x oracle)")
+    print(f"  Raw main channel              : {raw_rms/oracle_rms:6.1f}x")
+    print(f"  Wiener filter (offline)       : {wiener_rms/oracle_rms:6.1f}x{wiener_ss/oracle_ss:15.1f}x")
+    print(f"  IIR adaptive filter (online)  : {iir_rms/oracle_rms:6.1f}x{iir_ss/oracle_ss:15.1f}x")
     if lstm_clean is not None:
         lstm_rms = rms(lstm_clean)
         lstm_ss  = rms(lstm_clean[ss:])
-        print(f"  Supervised LSTM               : {lstm_rms/oracle_rms:6.1f}×{lstm_ss/oracle_ss:15.1f}×")
+        print(f"  Supervised LSTM               : {lstm_rms/oracle_rms:6.1f}x{lstm_ss/oracle_ss:15.1f}x")
     if rl_clean is not None:
         rl_rms = rms(rl_clean)
         rl_ss  = rms(rl_clean[ss:])
@@ -338,7 +340,7 @@ def print_metrics(data, lms_clean, iir_clean, rl_clean, lstm_clean=None,
             linear_floor = float(np.sqrt(rms(data["coupling_tilt"])**2 + oracle_rms**2))
             if rl_rms < linear_floor:
                 beats = " *** BEATS LINEAR FLOOR ***"
-        print(f"  RL agent (RecurrentPPO)       : {rl_rms/oracle_rms:6.1f}×{rl_ss/oracle_ss:15.1f}×{beats}")
+        print(f"  RL agent (RecurrentPPO)       : {rl_rms/oracle_rms:6.1f}x{rl_ss/oracle_ss:15.1f}x{beats}")
     print("=" * 72)
 
 
@@ -398,18 +400,21 @@ def main():
           f"(fs={cfg.fs} Hz, {len(data['time'])} samples)")
 
     # Only use witness Y for baselines when tilt coupling is active;
-    # otherwise it doubles the filter size (2·M taps) for zero benefit,
-    # drastically slowing convergence.
+    # otherwise it doubles the filter size for zero benefit.
     use_wy = cfg.tilt_coupling
 
-    # --- NLMS baseline ---
-    # Normalised LMS: dimensionless step size (0, 2), stable for coloured
-    # seismic signals with large eigenvalue spread.
-    lms_clean = run_lms(data, filter_length=window_size, step_size=0.1,
-                        use_witness_y=use_wy)
-    print("NLMS filter done.")
+    # --- Training data for offline methods (Wiener, supervised LSTM) ---
+    print(f"Generating {train_duration:.0f} s of training data  "
+          f"(seed={args.seed + 1000})…")
+    train_sim  = SeismicSignalSimulator(cfg, seed=args.seed + 1000)
+    train_data = train_sim.generate_episode(duration=train_duration, signal_amplitude=0.0)
 
-    # --- IIR baseline ---
+    # --- Wiener filter baseline (batch-optimal linear) ---
+    wiener_clean = run_wiener(train_data, data, filter_length=window_size,
+                              use_witness_y=use_wy)
+    print("Wiener filter done.")
+
+    # --- IIR adaptive filter baseline (online) ---
     iir_clean = run_iir(data, feedforward_length=window_size, step_size=0.1,
                         use_witness_y=use_wy)
     print("IIR filter done.")
@@ -417,10 +422,7 @@ def main():
     # --- Supervised LSTM baseline (paper approach) ---
     lstm_clean = None
     if not args.no_lstm:
-        print(f"Training supervised LSTM on {train_duration:.0f} s episode "
-              f"(seed={args.seed + 1000})…")
-        train_sim  = SeismicSignalSimulator(cfg, seed=args.seed + 1000)
-        train_data = train_sim.generate_episode(duration=train_duration, signal_amplitude=0.0)
+        print(f"Training supervised LSTM ({args.lstm_epochs} epochs)…")
         lstm_clean = run_supervised_lstm(
             train_data, data,
             window_size=window_size,
@@ -457,9 +459,9 @@ def main():
             print(f"No model found at {model_zip} — run  python train.py  first.")
             print("Proceeding without RL agent.")
 
-    print_metrics(data, lms_clean, iir_clean, rl_clean, lstm_clean=lstm_clean)
+    print_metrics(data, wiener_clean, iir_clean, rl_clean, lstm_clean=lstm_clean)
     plot_overview(
-        data, lms_clean, iir_clean, rl_clean,
+        data, wiener_clean, iir_clean, rl_clean,
         save_dir=args.save_dir, fs=cfg.fs,
         lstm_clean=lstm_clean,
     )
