@@ -41,10 +41,10 @@ from noise_removal.policy import DilatedCausalConvExtractor
 
 def parse_args():
     p = argparse.ArgumentParser(description="Train PPO seismic noise-cancellation agent")
-    p.add_argument("--timesteps", type=int, default=2_000_000,
-                   help="Total training timesteps (default: 2 000 000)")
-    p.add_argument("--n-envs", type=int, default=4,
-                   help="Number of parallel training environments (default: 4)")
+    p.add_argument("--timesteps", type=int, default=5_000_000,
+                   help="Total training timesteps (default: 5 000 000)")
+    p.add_argument("--n-envs", type=int, default=8,
+                   help="Number of parallel training environments (default: 8)")
     p.add_argument("--window-size", type=int, default=None,
                    help="Observation window in samples "
                         "(default: 240 = 60 s @ 4 Hz)")
@@ -179,10 +179,10 @@ def main():
         model = RecurrentPPO(
             "MlpLstmPolicy",
             vec_env,
-            n_steps=4096,
-            batch_size=256,
+            n_steps=2048,
+            batch_size=128,
             n_epochs=10,
-            learning_rate=3e-4,
+            learning_rate=1e-4,
             gamma=0.999,   # 250 s horizon at 4 Hz; 0.99 (25 s) is too short vs OU timescale 600 s
             gae_lambda=0.95,
             clip_range=0.1,

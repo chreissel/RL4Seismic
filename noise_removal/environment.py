@@ -65,7 +65,7 @@ class NoiseCancellationEnv(gym.Env):
         config: Optional[SeismicConfig] = None,
         window_size: int = 240,
         episode_duration: float = 300.0,
-        action_clip: float = 40.0,   # t2l_gain=8.0 → T_gain_max=20.0, peak tilt ≈ 20; +0.5 linear
+        action_clip: float = 15.0,   # coupling peak ≈ t2l_gain*tilt_peak + linear ≈ 12; 15 gives margin
         freq_reward: bool = False,
         freq_band_low: float = 0.05,
         freq_band_high: float = 1.5,
