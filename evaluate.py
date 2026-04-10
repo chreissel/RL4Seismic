@@ -38,7 +38,7 @@ import matplotlib.gridspec as gridspec
 from scipy.signal import welch
 
 from noise_removal import NoiseCancellationEnv, SeismicConfig, SeismicSignalSimulator
-from baselines import IIRFilter, SupervisedLSTM, WienerFilter
+from baselines import IIRFilter, SupervisedLSTM, WienerFilter, TopHatWienerFilter
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +59,25 @@ def run_wiener(
     wy_train = train_data["witness_y"] if use_witness_y else None
     wy_eval = eval_data["witness_y"] if use_witness_y else None
     filt = WienerFilter(filter_length=filter_length)
+    filt.fit(train_data["witness_x"], train_data["main"], witness_y=wy_train)
+    return filt.run(eval_data["witness_x"], eval_data["main"], witness_y=wy_eval)
+
+
+def run_tophat_wiener(
+    train_data: dict,
+    eval_data: dict,
+    fs: float = 4.0,
+    f_low: float = 0.1,
+    f_high: float = 0.3,
+    filter_length: int = 240,
+    use_witness_y: bool = True,
+) -> np.ndarray:
+    """Train a top-hat Wiener filter (Reissel et al. 2025) and apply it."""
+    wy_train = train_data["witness_y"] if use_witness_y else None
+    wy_eval = eval_data["witness_y"] if use_witness_y else None
+    filt = TopHatWienerFilter(
+        fs=fs, f_low=f_low, f_high=f_high, filter_length=filter_length,
+    )
     filt.fit(train_data["witness_x"], train_data["main"], witness_y=wy_train)
     return filt.run(eval_data["witness_x"], eval_data["main"], witness_y=wy_eval)
 
@@ -183,6 +202,7 @@ def plot_overview(
     save_dir: str,
     fs: float = 4.0,
     lstm_clean: Optional[np.ndarray] = None,
+    tophat_clean: Optional[np.ndarray] = None,
 ):
     t = data["time"]
     oracle_clean = data["sensor_noise"]
@@ -209,6 +229,8 @@ def plot_overview(
     ax1 = fig.add_subplot(gs[1, 0])
     ax1.plot(t[mask], data["main"][mask], alpha=0.6, lw=0.8, label="Raw", color="grey")
     ax1.plot(t[mask], wiener_clean[mask], alpha=0.8, lw=0.9, label="Wiener", color="tab:orange")
+    if tophat_clean is not None:
+        ax1.plot(t[mask], tophat_clean[mask], alpha=0.8, lw=0.9, label="Top-hat Wiener", color="tab:brown")
     ax1.plot(t[mask], iir_clean[mask], alpha=0.8, lw=0.9, label="IIR", color="tab:purple")
     if lstm_clean is not None:
         ax1.plot(t[mask], lstm_clean[mask], alpha=0.9, lw=0.9, label="LSTM (supervised)", color="tab:green")
@@ -224,12 +246,15 @@ def plot_overview(
     # ---- PSD comparison ----
     ax2 = fig.add_subplot(gs[1, 1])
     nperseg = min(512, len(data["main"]))
-    for sig, label, color, lw in [
+    psd_entries = [
         (data["main"],   "Raw",    "grey",       1.0),
         (wiener_clean,   "Wiener", "tab:orange", 1.2),
         (iir_clean,      "IIR",    "tab:purple", 1.2),
         (oracle_clean,   "Oracle", "tab:red",    1.0),
-    ]:
+    ]
+    if tophat_clean is not None:
+        psd_entries.insert(2, (tophat_clean, "Top-hat Wiener", "tab:brown", 1.2))
+    for sig, label, color, lw in psd_entries:
         f_psd, pxx = welch(sig, fs=fs, nperseg=nperseg)
         ax2.semilogy(f_psd, pxx, label=label, color=color, lw=lw, alpha=0.8)
     if lstm_clean is not None:
@@ -254,6 +279,8 @@ def plot_overview(
         ])
     ax3.plot(t, rolling_rms(data["main"]), lw=0.8, label="Raw", color="grey", alpha=0.7)
     ax3.plot(t, rolling_rms(wiener_clean), lw=0.9, label="Wiener", color="tab:orange")
+    if tophat_clean is not None:
+        ax3.plot(t, rolling_rms(tophat_clean), lw=0.9, label="Top-hat Wiener", color="tab:brown")
     ax3.plot(t, rolling_rms(iir_clean), lw=0.9, label="IIR", color="tab:purple")
     if lstm_clean is not None:
         ax3.plot(t, rolling_rms(lstm_clean), lw=0.9, label="LSTM (supervised)", color="tab:green")
@@ -271,10 +298,14 @@ def plot_overview(
     labels = ["Raw", "Wiener", "IIR", "Oracle"]
     values = [rms(data["main"]), rms(wiener_clean), rms(iir_clean), rms(oracle_clean)]
     colors = ["grey", "tab:orange", "tab:purple", "tab:red"]
+    if tophat_clean is not None:
+        labels.insert(2, "Top-hat")
+        values.insert(2, rms(tophat_clean))
+        colors.insert(2, "tab:brown")
     if lstm_clean is not None:
-        labels.insert(3, "LSTM")
-        values.insert(3, rms(lstm_clean))
-        colors.insert(3, "tab:green")
+        labels.insert(-1, "LSTM")
+        values.insert(-1, rms(lstm_clean))
+        colors.insert(-1, "tab:green")
     if rl_clean is not None:
         labels.insert(-1, "RL (PPO)")
         values.insert(-1, rms(rl_clean))
@@ -295,7 +326,7 @@ def plot_overview(
 
 
 def print_metrics(data, wiener_clean, iir_clean, rl_clean, lstm_clean=None,
-                  warmup_fraction: float = 0.25):
+                  tophat_clean=None, warmup_fraction: float = 0.25):
     """Print RMS metrics for all methods.
 
     Reports both full-episode and steady-state (after warmup) performance.
@@ -327,6 +358,10 @@ def print_metrics(data, wiener_clean, iir_clean, rl_clean, lstm_clean=None,
         print(f"  Tilt-horizontal coupling RMS  : {tilt_rms:.4f}  ({tilt_rms/oracle_rms:.1f}x oracle)")
     print(f"  Raw main channel              : {raw_rms/oracle_rms:6.1f}x")
     print(f"  Wiener filter (offline)       : {wiener_rms/oracle_rms:6.1f}x{wiener_ss/oracle_ss:15.1f}x")
+    if tophat_clean is not None:
+        tophat_rms = rms(tophat_clean)
+        tophat_ss  = rms(tophat_clean[ss:])
+        print(f"  Top-hat Wiener (0.1–0.3 Hz)  : {tophat_rms/oracle_rms:6.1f}x{tophat_ss/oracle_ss:15.1f}x")
     print(f"  IIR adaptive filter (online)  : {iir_rms/oracle_rms:6.1f}x{iir_ss/oracle_ss:15.1f}x")
     if lstm_clean is not None:
         lstm_rms = rms(lstm_clean)
@@ -414,6 +449,14 @@ def main():
                               use_witness_y=use_wy)
     print("Wiener filter done.")
 
+    # --- Top-hat Wiener filter (Reissel et al. 2025, arXiv:2511.19682) ---
+    tophat_clean = run_tophat_wiener(
+        train_data, data, fs=cfg.fs,
+        f_low=0.1, f_high=0.3, filter_length=window_size,
+        use_witness_y=use_wy,
+    )
+    print("Top-hat Wiener filter done.")
+
     # --- IIR adaptive filter baseline (online) ---
     iir_clean = run_iir(data, feedforward_length=window_size, step_size=0.1,
                         use_witness_y=use_wy)
@@ -459,11 +502,13 @@ def main():
             print(f"No model found at {model_zip} — run  python train.py  first.")
             print("Proceeding without RL agent.")
 
-    print_metrics(data, wiener_clean, iir_clean, rl_clean, lstm_clean=lstm_clean)
+    print_metrics(data, wiener_clean, iir_clean, rl_clean, lstm_clean=lstm_clean,
+                  tophat_clean=tophat_clean)
     plot_overview(
         data, wiener_clean, iir_clean, rl_clean,
         save_dir=args.save_dir, fs=cfg.fs,
         lstm_clean=lstm_clean,
+        tophat_clean=tophat_clean,
     )
     print("\nDone. Figures saved to", args.save_dir)
 
