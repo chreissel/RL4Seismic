@@ -378,16 +378,33 @@ def parse_args():
                    help="Training epochs for the supervised LSTM (default: 30)")
     p.add_argument("--dilated-conv", action="store_true",
                    help="Load model as plain PPO (DLS) instead of RecurrentPPO")
+    p.add_argument("--sensor-noise-color",
+                   choices=("white", "pink", "brown"),
+                   default="white",
+                   help="Spectral shape of the GS13X sensor noise (oracle noise "
+                        "floor). 'white' = flat PSD (default), 'pink' = 1/f, "
+                        "'brown' = 1/f². RMS is always sensor_noise_sigma.")
+    p.add_argument("--sensor-noise-exponent", type=float, default=None,
+                   help="Override --sensor-noise-color with a custom spectral "
+                        "exponent α (PSD ∝ 1/f^α).")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
 
+    color_to_exp = {"white": 0.0, "pink": 1.0, "brown": 2.0}
+    sensor_exp = (
+        args.sensor_noise_exponent
+        if args.sensor_noise_exponent is not None
+        else color_to_exp[args.sensor_noise_color]
+    )
+
     cfg = SeismicConfig(
         drift=not args.no_drift,
         regime_changes=args.regime_changes,
         tilt_coupling=not args.no_tilt_coupling,
+        sensor_noise_exponent=sensor_exp,
     )
 
     window_size = args.window_size if args.window_size is not None else cfg.filter_length

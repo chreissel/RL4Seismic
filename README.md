@@ -142,6 +142,11 @@ python train.py --timesteps 5_000_000
 python train.py --dilated-conv
 python train.py --dilated-conv --multi-source --tilt-coupling
 python train.py --dilated-conv --conv-layers 8 --conv-channels 64   # explicit defaults
+
+# Coloured sensor (oracle) noise floor: PSD ∝ 1/f^α with RMS held fixed
+python train.py --sensor-noise-color pink          # 1/f
+python train.py --sensor-noise-color brown         # 1/f²
+python train.py --sensor-noise-exponent 0.5        # arbitrary α
 ```
 
 Saves model to `models/ppo_noise_cancellation.zip` and VecNormalize stats to `models/ppo_noise_cancellation_vecnorm.pkl`.

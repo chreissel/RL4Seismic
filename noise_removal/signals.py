@@ -20,7 +20,17 @@ Obtaining channel
 -----------------
 The main (obtaining) channel is modelled as a GS13X broadband seismometer
 measuring the LIGO test-mass degree of freedom.  Its self-noise floor is
-captured by additive Gaussian noise n_GS13X(t) ~ N(0, σ²_sensor).
+captured by additive zero-mean Gaussian noise n_GS13X(t) with RMS
+``sensor_noise_sigma`` and a tunable power spectral density
+``PSD(f) ∝ 1/f^sensor_noise_exponent``:
+
+    sensor_noise_exponent = 0.0 → white   (flat PSD, the default)
+    sensor_noise_exponent = 1.0 → pink    (1/f,  −3 dB/octave)
+    sensor_noise_exponent = 2.0 → brown   (1/f², −6 dB/octave)
+
+The oracle (best achievable residual) is simply the RMS of this trace; its
+value is independent of the colour because ``_colored_noise`` renormalises
+the output to ``sensor_noise_sigma``.
 
 Witness channels
 ----------------
@@ -145,8 +155,21 @@ class SeismicConfig:
     # --- GS13X obtaining channel sensor noise ---
     # The GS13X (Geotech S-13) is a short-period (1 Hz) broadband seismometer
     # used at LIGO to sense test-mass motion.  Its self-noise floor is modelled
-    # as additive white Gaussian noise with amplitude sensor_noise_sigma.
-    sensor_noise_sigma: float = 0.05     # GS13X-like sensor noise (obtaining channel)
+    # as additive zero-mean Gaussian noise with RMS ``sensor_noise_sigma`` and
+    # a power spectral density proportional to 1/f^``sensor_noise_exponent``:
+    #
+    #   sensor_noise_exponent = 0.0 → white noise           (flat PSD)
+    #   sensor_noise_exponent = 1.0 → pink / flicker noise  (1/f,  −3 dB/oct)
+    #   sensor_noise_exponent = 2.0 → brown / red noise     (1/f², −6 dB/oct)
+    #
+    # Real GS13X self-noise is approximately flat above ~0.5 Hz and rises
+    # gently at lower frequencies, so "white" or slightly pink (α ≈ 0.5–1.0)
+    # are both physically plausible choices.  The helper `_colored_noise`
+    # renormalises the resulting trace so that its RMS is exactly
+    # ``sensor_noise_sigma`` regardless of the exponent, keeping the oracle
+    # noise floor comparable across colours.
+    sensor_noise_sigma: float = 0.05     # GS13X-like sensor noise RMS (obtaining channel)
+    sensor_noise_exponent: float = 0.0   # PSD ∝ 1/f^α; 0=white, 1=pink, 2=brown
 
     # --- regime changes (sudden coupling path change) ---
     regime_changes: bool = False
@@ -282,6 +305,60 @@ def _double_leaky_integrator(
     return y2
 
 
+def _colored_noise(
+    n: int,
+    sigma: float,
+    exponent: float,
+    fs: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """
+    Gaussian noise with power spectral density proportional to 1/f^exponent.
+
+    Implementation: generate zero-mean unit-variance white Gaussian noise,
+    scale its real-FFT magnitudes by 1/f^(exponent/2), inverse-transform and
+    renormalise so the output RMS equals ``sigma``.  The DC bin is zeroed,
+    which keeps the trace mean-free and avoids a 1/0 singularity.
+
+    Parameters
+    ----------
+    n        : number of samples to generate
+    sigma    : target RMS of the output trace (same units as ``sensor_noise_sigma``)
+    exponent : spectral exponent α.  Special values:
+                  0  → white noise (flat PSD)
+                  1  → pink / flicker noise (1/f,  −3 dB/octave)
+                  2  → brown / red noise (1/f², −6 dB/octave, Brownian)
+               Negative exponents give blue (−1) / violet (−2) noise.
+    fs       : sampling rate in Hz (only used to build the frequency axis;
+               with RMS renormalisation the exact frequency grid does not
+               change the resulting RMS, only the spectral shape)
+    rng      : numpy Generator
+
+    Notes
+    -----
+    For ``exponent == 0`` this falls back to ``rng.normal(0, sigma, n)``
+    unchanged, so the default behaviour is identical to the previous
+    white-noise sensor model.
+    """
+    if exponent == 0.0:
+        return rng.normal(0.0, sigma, n)
+
+    white = rng.normal(0.0, 1.0, n)
+    spec = np.fft.rfft(white)
+    freqs = np.fft.rfftfreq(n, d=1.0 / fs)
+
+    scale = np.zeros_like(freqs)
+    nz = freqs > 0
+    scale[nz] = freqs[nz] ** (-exponent / 2.0)
+
+    colored = np.fft.irfft(spec * scale, n=n)
+
+    rms_val = np.sqrt(np.mean(colored**2))
+    if rms_val < 1e-12:
+        return colored
+    return (sigma / rms_val) * colored
+
+
 def _seismic_ground_motion(
     n: int, amplitude: float, fs: float, rng: np.random.Generator
 ) -> np.ndarray:
@@ -409,7 +486,15 @@ class SeismicSignalSimulator:
         witness_y += self.rng.normal(0.0, cfg.witness_noise_sigma, n)
 
         # --- GS13X sensor noise (obtaining channel) ---
-        sensor_noise = self.rng.normal(0.0, cfg.sensor_noise_sigma, n)
+        # Either white (exponent=0) or coloured (PSD ∝ 1/f^α); see
+        # `_colored_noise` and `SeismicConfig.sensor_noise_exponent`.
+        sensor_noise = _colored_noise(
+            n,
+            sigma=cfg.sensor_noise_sigma,
+            exponent=cfg.sensor_noise_exponent,
+            fs=cfg.fs,
+            rng=self.rng,
+        )
 
         # --- injected test signal (zero during training) ---
         true_signal = (
