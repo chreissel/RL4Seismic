@@ -136,8 +136,6 @@ def plot_tilt_proxy():
               label=f"new proxy: double leaky integrator  (τ={cfg.tilt_leak_timescale}s)")
     ax.axvspan(0.05, 0.5, color="grey", alpha=0.12,
                label="microseismic band  [0.05, 0.5] Hz")
-    ax.axvline(1.0 / (2 * np.pi * cfg.tilt_leak_timescale), color="tab:green",
-               lw=0.8, ls=":", alpha=0.6)
     ax.set_xlabel("Frequency (Hz)")
     ax.set_ylabel("PSD  (unit-RMS normalised)")
     ax.set_title("Tilt proxy PSD — old (finite-diff) vs new (double leaky integrator)")
