@@ -45,7 +45,9 @@ def _save(fig, name):
 # Plot 1 — time-domain anatomy of one episode
 # ---------------------------------------------------------------------------
 def plot_timedomain():
-    cfg = sg.SeismicConfig()  # defaults: drift=True, tilt_coupling=True, white sensor
+    # Use brown (1/f²) sensor noise so the oracle floor shows visible
+    # low-frequency structure in the trace instead of being i.i.d. hash.
+    cfg = sg.SeismicConfig(sensor_noise_exponent=2.0)
     sim = sg.SeismicSignalSimulator(cfg, seed=0)
     d = sim.generate_episode(duration=300.0)
 
@@ -85,7 +87,7 @@ def plot_timedomain():
     axes[2].plot(t[mask], d["main"][mask], lw=0.8, color="black",
                  label="main y(t)")
     axes[2].plot(t[mask], d["sensor_noise"][mask], lw=0.8, color="tab:green",
-                 alpha=0.9, label="sensor noise (oracle floor)")
+                 alpha=0.9, label="sensor noise n(t)  (brown, 1/f², oracle floor)")
     axes[2].set_xlabel("Time (s)")
     axes[2].set_ylabel("Obtaining channel")
     axes[2].set_title("y(t) = h_x(t)⊛w_x(t) + C_tilt(t) + n(t)")
