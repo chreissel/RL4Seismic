@@ -20,7 +20,21 @@ Obtaining channel
 -----------------
 The main (obtaining) channel is modelled as a GS13X broadband seismometer
 measuring the LIGO test-mass degree of freedom.  Its self-noise floor is
-captured by additive Gaussian noise n_GS13X(t) ~ N(0, σ²_sensor).
+captured by additive zero-mean Gaussian noise n_GS13X(t) with RMS
+``sensor_noise_sigma`` and a tunable power spectral density
+``PSD(f) ∝ 1/f^sensor_noise_exponent``:
+
+    sensor_noise_exponent = 0.0 → white   (flat PSD, the default)
+    sensor_noise_exponent = 1.0 → pink    (1/f,  −3 dB/octave)
+    sensor_noise_exponent = 2.0 → brown   (1/f², −6 dB/octave)
+
+The oracle (best achievable residual) is simply the RMS of this trace; by
+default ``_colored_noise`` renormalises the output so its **broadband** RMS
+equals ``sensor_noise_sigma``.  Setting ``sensor_noise_band=(f_low, f_high)``
+switches the normalisation to the **in-band** RMS measured on
+[f_low, f_high] via Parseval's theorem — useful for steep spectra (α ≥ 2),
+where pinning the broadband RMS leaves most of the power near DC and
+underpopulates the microseismic evaluation band.
 
 Witness channels
 ----------------
@@ -32,19 +46,25 @@ Each has a small additive self-noise term.
 
 Tilt-horizontal coupling
 ------------------------
-Low-frequency seismic waves (Rayleigh waves) tilt the ground.  The Y-direction
-seismic motion creates a ground tilt about the X axis:
-
-    θ_y(t) ≈ (1/c_R) · dw_y/dt
-
-This tilt couples into the main channel via the alignment-dependent gain T(t):
+Low-frequency seismic waves (Rayleigh waves) tilt the ground and that tilt
+couples into the main channel via the alignment-dependent gain T(t):
 
     C_tilt(t) = T(t) · θ_y_proxy(t)
 
-where θ_y_proxy[t] = w_y[t] − w_y[t−1]  is a finite-difference
-approximation of dw_y/dt, and T(t) is the
-OU-drifting tilt-horizontal coupling gain representing the slowly changing
-mirror alignment.
+where θ_y_proxy(t) is a low-passed version of the Y witness obtained by
+passing w_y through a **double leaky integrator** (two cascaded first-order
+low-pass / leaky-integrator stages):
+
+    x1[t] = (1−α)·x1[t−1] + α·w_y[t]
+    θ_y_proxy[t] = (1−α)·θ_y_proxy[t−1] + α·x1[t]
+
+with α = 1 − exp(−Δt / τ_leak) and τ_leak = ``tilt_leak_timescale``.  This
+gives a bounded, smooth tilt proxy whose PSD rolls off as 1/ω⁴ at high
+frequency — avoiding the artificial high-frequency amplification of a
+finite-difference (≈ d/dt) proxy, which boosts the PSD above the
+microseismic band where tilt is not physically relevant.  T(t) is an
+OU-drifting alignment gain representing the slowly changing mirror
+alignment.
 
 For constant T, any linear adaptive filter can cancel C_tilt by learning the
 transfer function θ_y → main.  With drifting T(t) the filter must track the
@@ -139,8 +159,31 @@ class SeismicConfig:
     # --- GS13X obtaining channel sensor noise ---
     # The GS13X (Geotech S-13) is a short-period (1 Hz) broadband seismometer
     # used at LIGO to sense test-mass motion.  Its self-noise floor is modelled
-    # as additive white Gaussian noise with amplitude sensor_noise_sigma.
-    sensor_noise_sigma: float = 0.05     # GS13X-like sensor noise (obtaining channel)
+    # as additive zero-mean Gaussian noise with RMS ``sensor_noise_sigma`` and
+    # a power spectral density proportional to 1/f^``sensor_noise_exponent``:
+    #
+    #   sensor_noise_exponent = 0.0 → white noise           (flat PSD)
+    #   sensor_noise_exponent = 1.0 → pink / flicker noise  (1/f,  −3 dB/oct)
+    #   sensor_noise_exponent = 2.0 → brown / red noise     (1/f², −6 dB/oct)
+    #
+    # Real GS13X self-noise is approximately flat above ~0.5 Hz and rises
+    # gently at lower frequencies, so "white" or slightly pink (α ≈ 0.5–1.0)
+    # are both physically plausible choices.  The helper `_colored_noise`
+    # renormalises the resulting trace so that its RMS is exactly
+    # ``sensor_noise_sigma`` regardless of the exponent, keeping the oracle
+    # noise floor comparable across colours.
+    sensor_noise_sigma: float = 0.05     # GS13X-like sensor noise RMS (obtaining channel)
+    sensor_noise_exponent: float = 0.0   # PSD ∝ 1/f^α; 0=white, 1=pink, 2=brown
+    # Optional (f_low, f_high) frequency window over which the sensor-noise
+    # RMS is enforced.  When None (default), ``sensor_noise_sigma`` is the
+    # broadband RMS.  When set, ``sensor_noise_sigma`` is interpreted as the
+    # in-band RMS measured on [f_low, f_high] via Parseval's theorem — this
+    # is the physically meaningful quantity for steep spectra (α ≥ 2), where
+    # the broadband RMS is dominated by near-DC power irrelevant to the
+    # seismic band.  Example: ``sensor_noise_band=(0.05, 0.5)`` pins the
+    # oracle floor inside the microseismic evaluation band regardless of
+    # ``sensor_noise_exponent``.
+    sensor_noise_band: Optional[Tuple[float, float]] = None
 
     # --- regime changes (sudden coupling path change) ---
     regime_changes: bool = False
@@ -153,18 +196,32 @@ class SeismicConfig:
     #
     #   C_tilt(t) = T(t) · θ_y_proxy(t)
     #
-    # where θ_y_proxy[t] = w_y[t] − w_y[t−1] is the first-difference of the
-    # Y seismometer (proxy for dw_y/dt ∝ tilt angle), and T(t) is the
+    # θ_y_proxy(t) is obtained by passing w_y through a **double leaky
+    # integrator** (two cascaded first-order low-pass / leaky-integrator
+    # stages with time constant ``tilt_leak_timescale``).  This gives a
+    # bounded, smooth tilt proxy whose PSD rolls off as 1/ω⁴ at high
+    # frequency, avoiding the high-frequency amplification of a naïve
+    # finite-difference (≈ d/dt) proxy, which inflates the PSD above the
+    # microseismic band where tilt is not physically relevant.  T(t) is the
     # OU-drifting alignment-dependent gain.
     #
     # With drift=True, T(t) is non-stationary (OU), so static linear filters
     # cannot fully cancel C_tilt without re-adapting.  With drift=False, T is
     # constant and a static linear filter CAN cancel C_tilt.
     tilt_coupling: bool = True
-    t2l_gain: float = 43.0              # mean tilt-horizontal coupling gain
-                                         # (acts on raw diff(w_y), not normalised;
-                                         #  T2L coupling RMS ≈ t2l_gain × 0.186 ≈ 8.0,
-                                         #  which dominates over linear coupling ≈ 0.5)
+    tilt_leak_timescale: float = 2.0    # seconds — time constant of each of the
+                                         # two cascaded leaky-integrator stages.
+                                         # 2 s ≈ 0.08 Hz corner, just below the
+                                         # 0.14 Hz secondary microseism peak:
+                                         # preserves in-band tilt energy while
+                                         # rolling off the high-frequency tail.
+    t2l_gain: float = 43.0              # mean tilt-horizontal coupling gain.
+                                         # Acts on the double-leaky-integrated
+                                         # witness_y (not normalised), so the
+                                         # resulting C_tilt RMS depends on
+                                         # tilt_leak_timescale.  With the
+                                         # defaults above C_tilt is tuned to
+                                         # dominate over linear coupling ≈ 0.5.
     t2l_gain_drift_sigma: float = 2.7   # OU fluctuation of T(t)
     t2l_thermal_timescale: float = 600.0 # seconds — alignment changes slowly
 
@@ -225,6 +282,136 @@ def _ou_process(
     for i in range(1, n):
         x[i] = exp_dt * x[i - 1] + (1.0 - exp_dt) * mean + raw_noise[i]
     return x
+
+
+def _double_leaky_integrator(
+    x: np.ndarray, timescale: float, fs: float
+) -> np.ndarray:
+    """
+    Apply two cascaded first-order leaky-integrator / low-pass stages:
+
+        y1[t] = (1−α)·y1[t−1] + α·x[t]
+        y2[t] = (1−α)·y2[t−1] + α·y1[t]
+
+    with α = 1 − exp(−Δt / τ), τ = ``timescale``.  The resulting filter has
+    unity DC gain and a 1/ω² magnitude rolloff per stage (1/ω⁴ cascaded) for
+    frequencies well above the corner f_c ≈ 1 / (2π·τ).
+
+    Used for the tilt-horizontal coupling proxy: the witness is smoothed with
+    a well-behaved low-pass instead of a high-pass-like finite difference, so
+    the resulting tilt proxy does not artificially amplify high frequencies in
+    its PSD — only the physically relevant low-frequency (microseismic) band
+    contributes meaningfully.
+    """
+    dt = 1.0 / fs
+    alpha = 1.0 - np.exp(-dt / timescale)
+    one_minus_alpha = 1.0 - alpha
+
+    y1 = np.empty_like(x)
+    y2 = np.empty_like(x)
+    y1_prev = 0.0
+    y2_prev = 0.0
+    for i in range(x.shape[0]):
+        y1_prev = one_minus_alpha * y1_prev + alpha * x[i]
+        y2_prev = one_minus_alpha * y2_prev + alpha * y1_prev
+        y1[i] = y1_prev
+        y2[i] = y2_prev
+    return y2
+
+
+def _colored_noise(
+    n: int,
+    sigma: float,
+    exponent: float,
+    fs: float,
+    rng: np.random.Generator,
+    band: Optional[Tuple[float, float]] = None,
+) -> np.ndarray:
+    """
+    Gaussian noise with power spectral density proportional to 1/f^exponent.
+
+    Implementation: generate zero-mean unit-variance white Gaussian noise,
+    scale its real-FFT magnitudes by 1/f^(exponent/2), inverse-transform and
+    renormalise so that either the broadband RMS or the RMS measured within
+    a chosen frequency window equals ``sigma``.  The DC bin is zeroed, which
+    keeps the trace mean-free and avoids a 1/0 singularity for α > 0.
+
+    Parameters
+    ----------
+    n        : number of samples to generate
+    sigma    : target RMS of the output trace.  Interpreted as **broadband**
+               RMS when ``band is None`` and as **in-band** RMS (measured on
+               [f_low, f_high]) when ``band`` is supplied.
+    exponent : spectral exponent α.  Special values:
+                  0  → white noise (flat PSD)
+                  1  → pink / flicker noise (1/f,  −3 dB/octave)
+                  2  → brown / red noise (1/f², −6 dB/octave, Brownian)
+               Negative exponents give blue (−1) / violet (−2) noise.
+    fs       : sampling rate in Hz (sets the frequency grid used for spectral
+               shaping and for band-limited RMS measurement)
+    rng      : numpy Generator
+    band     : optional ``(f_low, f_high)`` frequency window in Hz.  When
+               given, the trace is renormalised so its RMS restricted to
+               [f_low, f_high] equals ``sigma``, measured exactly via
+               Parseval's theorem on the rFFT bins that fall inside the band.
+               When ``None`` (default), the broadband RMS is normalised —
+               identical behaviour to the earlier version of this helper.
+
+    Notes
+    -----
+    For ``exponent == 0`` and ``band is None`` this short-circuits to
+    ``rng.normal(0, sigma, n)``, so the default behaviour is bit-identical
+    to the original white-noise sensor model.
+
+    Why Parseval and not a bandpass filter?  A Butterworth bandpass would
+    introduce transients and skirt leakage at the band edges, so the user's
+    later PSD measurement would not see exactly ``sigma`` inside the band.
+    The Parseval method sums the rFFT bin powers whose centre frequencies
+    fall inside [f_low, f_high] and weights them correctly for a real FFT
+    (DC and Nyquist count once, interior bins count twice), which matches
+    what ``scipy.signal.welch`` would report for the same window up to the
+    usual spectral-estimator variance.
+    """
+    if exponent == 0.0 and band is None:
+        return rng.normal(0.0, sigma, n)
+
+    white = rng.normal(0.0, 1.0, n)
+    spec = np.fft.rfft(white)
+    freqs = np.fft.rfftfreq(n, d=1.0 / fs)
+
+    if exponent != 0.0:
+        scale = np.zeros_like(freqs)
+        nz = freqs > 0
+        scale[nz] = freqs[nz] ** (-exponent / 2.0)
+        spec = spec * scale
+
+    colored = np.fft.irfft(spec, n=n)
+
+    if band is None:
+        rms_val = np.sqrt(np.mean(colored**2))
+    else:
+        f_low, f_high = band
+        if not (f_high > f_low >= 0.0):
+            raise ValueError(
+                f"sensor_noise_band must satisfy 0 ≤ f_low < f_high; got {band}"
+            )
+        # Parseval for the real FFT: mean-square contribution of each bin is
+        # weight·|X[k]|²/N², where weight = 1 for DC (and Nyquist when N is
+        # even) and 2 for all interior bins (which fold in their Hermitian
+        # conjugate).  Summing only the in-band bins gives the exact
+        # mean-square of the ideally bandpassed trace.
+        power = np.abs(spec) ** 2
+        weights = np.full_like(power, 2.0)
+        weights[0] = 1.0                        # DC bin
+        if n % 2 == 0:
+            weights[-1] = 1.0                   # Nyquist bin
+        mask = (freqs >= f_low) & (freqs <= f_high)
+        band_ms = float(np.sum(power[mask] * weights[mask]) / (n * n))
+        rms_val = np.sqrt(band_ms)
+
+    if rms_val < 1e-12:
+        return colored
+    return (sigma / rms_val) * colored
 
 
 def _seismic_ground_motion(
@@ -290,9 +477,9 @@ class SeismicSignalSimulator:
       - Tilt-horizontal coupling: Y seismic → ground tilt → main channel
 
     The tilt-horizontal coupling C_tilt(t) = T(t) · θ_y_proxy(t) is a bilinear
-    product of the slowly drifting alignment gain T(t) and the normalised
-    first-difference of witness_y (tilt proxy).  With drift=True, static linear
-    filters cannot track the drifting T(t); with drift=False they can.
+    product of the slowly drifting alignment gain T(t) and a double-leaky-
+    integrated version of witness_y (the tilt proxy).  With drift=True, static
+    linear filters cannot track the drifting T(t); with drift=False they can.
 
     Usage
     -----
@@ -354,7 +541,18 @@ class SeismicSignalSimulator:
         witness_y += self.rng.normal(0.0, cfg.witness_noise_sigma, n)
 
         # --- GS13X sensor noise (obtaining channel) ---
-        sensor_noise = self.rng.normal(0.0, cfg.sensor_noise_sigma, n)
+        # Either white (exponent=0) or coloured (PSD ∝ 1/f^α); see
+        # `_colored_noise` and `SeismicConfig.sensor_noise_exponent`.
+        # If ``sensor_noise_band`` is set, ``sensor_noise_sigma`` is enforced
+        # as the in-band RMS on that window instead of the broadband RMS.
+        sensor_noise = _colored_noise(
+            n,
+            sigma=cfg.sensor_noise_sigma,
+            exponent=cfg.sensor_noise_exponent,
+            fs=cfg.fs,
+            rng=self.rng,
+            band=cfg.sensor_noise_band,
+        )
 
         # --- injected test signal (zero during training) ---
         true_signal = (
@@ -490,21 +688,25 @@ class SeismicSignalSimulator:
 
         Physical mechanism
         ------------------
-        Rayleigh waves propagating along Y tilt the ground about the X axis.
-        For a Rayleigh wave with phase velocity c_R, the tilt angle is:
-
-            θ_y(ω) = (ω / c_R) · w_y(ω)   →   θ_y ≈ (1/c_R) · dw_y/dt
-
-        In the time domain this is approximated by a first-difference FIR:
-
-            θ_y_proxy[t] = w_y[t] − w_y[t−1]    (normalised to unit RMS)
-
-        The tilt θ_y couples into the main channel via the alignment-dependent
+        Rayleigh waves propagating along Y tilt the ground about the X axis,
+        and this tilt couples into the main channel via the alignment-dependent
         gain T(t), representing the mechanical lever arm between mirror tilt
-        and length noise (controlled by mirror angular alignment):
+        and length noise (controlled by mirror angular alignment).
 
-            C_tilt(t) = T(t) · θ_y_proxy(t)
+        Tilt proxy
+        ----------
+        θ_y_proxy(t) is obtained by passing witness_y through a **double
+        leaky integrator** — two cascaded first-order low-pass stages with
+        time constant ``tilt_leak_timescale`` (see `_double_leaky_integrator`).
+        The resulting filter has unity DC gain and a 1/ω⁴ magnitude rolloff
+        well above the corner frequency, which avoids the high-frequency PSD
+        amplification of a finite-difference (≈ d/dt) proxy.  Frequencies
+        above the microseismic band therefore contribute negligibly to the
+        tilt proxy — matching the physical observation that only low-frequency
+        ground motion tilts the test masses in a way that matters.
 
+        Drift
+        -----
         When config.drift=True, T(t) follows an Ornstein–Uhlenbeck process
         (mean = t2l_gain, σ = t2l_gain_drift_sigma), representing slow
         changes in mirror alignment.  Any static linear filter applied to
@@ -515,14 +717,14 @@ class SeismicSignalSimulator:
         """
         cfg = self.config
 
-        # --- tilt proxy: first-difference of Y seismometer (∝ dw_y/dt) ---
-        # No per-episode normalisation: C_tilt = T(t) · diff(w_y) directly.
+        # --- tilt proxy: double leaky integrator of the Y seismometer ---
+        # No per-episode normalisation: C_tilt = T(t) · tilt_proxy directly.
         # This ensures the coupling is a deterministic function of witness_y
         # and the coupling parameters, so offline methods (Wiener filter)
         # generalise across episodes without gain mismatch.
-        tilt_proxy = np.empty(n)
-        tilt_proxy[0] = 0.0
-        tilt_proxy[1:] = witness_y[1:] - witness_y[:-1]
+        tilt_proxy = _double_leaky_integrator(
+            witness_y, cfg.tilt_leak_timescale, cfg.fs
+        )
 
         # --- T(t): alignment-dependent coupling gain (drifts or fixed) ---
         if cfg.drift:

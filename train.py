@@ -71,6 +71,23 @@ def parse_args():
                    help="Lower edge of reward band in Hz (default: 0.05)")
     p.add_argument("--freq-high", type=float, default=1.5,
                    help="Upper edge of reward band in Hz (default: 1.5)")
+    p.add_argument("--sensor-noise-color",
+                   choices=("white", "pink", "brown"),
+                   default="white",
+                   help="Spectral shape of the GS13X sensor noise (oracle noise "
+                        "floor). 'white' = flat PSD (default), 'pink' = 1/f, "
+                        "'brown' = 1/f². The RMS is always sensor_noise_sigma.")
+    p.add_argument("--sensor-noise-exponent", type=float, default=None,
+                   help="Override --sensor-noise-color with a custom spectral "
+                        "exponent α (PSD ∝ 1/f^α). Any float is accepted.")
+    p.add_argument("--sensor-noise-band", type=float, nargs=2,
+                   metavar=("F_LOW", "F_HIGH"), default=None,
+                   help="Optional (f_low, f_high) Hz window over which to "
+                        "enforce the sensor-noise RMS. When given, "
+                        "sensor_noise_sigma is interpreted as the in-band RMS "
+                        "on this window (Parseval-exact) instead of the "
+                        "broadband RMS. Useful for coloured noise where the "
+                        "broadband RMS is dominated by near-DC power.")
     p.add_argument("--dilated-conv", action="store_true",
                    help="Use dilated causal convolution policy (PPO) instead of "
                         "LSTM policy (RecurrentPPO). Inspired by DeepMind DLS.")
@@ -101,10 +118,21 @@ def main():
     os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
     os.makedirs(args.log_dir, exist_ok=True)
 
+    color_to_exp = {"white": 0.0, "pink": 1.0, "brown": 2.0}
+    sensor_exp = (
+        args.sensor_noise_exponent
+        if args.sensor_noise_exponent is not None
+        else color_to_exp[args.sensor_noise_color]
+    )
+
+    sensor_band = tuple(args.sensor_noise_band) if args.sensor_noise_band else None
+
     config = SeismicConfig(
         drift=not args.no_drift,
         regime_changes=args.regime_changes,
         tilt_coupling=not args.no_tilt_coupling,
+        sensor_noise_exponent=sensor_exp,
+        sensor_noise_band=sensor_band,
     )
 
     window_size = args.window_size if args.window_size is not None else config.filter_length
@@ -114,7 +142,16 @@ def main():
     print(f"  RL Seismic Noise Cancellation — {algo_name}")
     print("=" * 60)
     print(f"  Sampling rate  : {config.fs} Hz")
-    print(f"  Sensor noise σ : {config.sensor_noise_sigma}  (GS13X obtaining channel)")
+    exp_to_name = {0.0: "white", 1.0: "pink", 2.0: "brown"}
+    color_name = exp_to_name.get(config.sensor_noise_exponent,
+                                 f"α={config.sensor_noise_exponent}")
+    if config.sensor_noise_band is not None:
+        f_lo, f_hi = config.sensor_noise_band
+        rms_scope = f"in-band RMS on [{f_lo}, {f_hi}] Hz"
+    else:
+        rms_scope = "broadband RMS"
+    print(f"  Sensor noise σ : {config.sensor_noise_sigma}  "
+          f"(GS13X obtaining channel, {color_name}, {rms_scope})")
     drift_str = "OU-drifting" if config.drift else "stationary"
     if config.tilt_coupling and config.regime_changes:
         print(f"  Coupling model : h_x(t)⊛w_x + C_tilt(t)  [{drift_str}, {config.n_regimes} regimes]")
