@@ -50,7 +50,9 @@ def plot_timedomain():
     d = sim.generate_episode(duration=300.0)
 
     t = d["time"]
-    mask = t < 60.0  # first 60 s
+    # The FIR coupling needs cfg.filter_length samples (60 s @ 4 Hz) to warm
+    # up, so plot the second 60 s window instead of the first.
+    mask = (t >= 60.0) & (t < 120.0)
 
     fig, axes = plt.subplots(3, 1, figsize=(10, 7.2), sharex=True)
 
@@ -64,14 +66,39 @@ def plot_timedomain():
     axes[0].grid(alpha=0.3)
 
     linear = d["coupling"] - d["coupling_tilt"]
-    axes[1].plot(t[mask], linear[mask], lw=0.8, color="tab:orange",
-                 label="h_x(t) ⊛ w_x  (linear FIR, OU drift)")
-    axes[1].plot(t[mask], d["coupling_tilt"][mask], lw=0.8, color="tab:red",
-                 label="C_tilt = T(t) · θ_y_proxy(t)  (bilinear)")
-    axes[1].set_ylabel("Coupling term")
-    axes[1].set_title("Coupling anatomy — linear (OU-drifting) + tilt (bilinear)")
-    axes[1].legend(loc="upper right", fontsize=8)
-    axes[1].grid(alpha=0.3)
+    lin_rms = float(np.sqrt(np.mean(linear**2)))
+    tilt_rms = float(np.sqrt(np.mean(d["coupling_tilt"]**2)))
+
+    # Twin y-axes so the linear term (RMS ~1.8) is not visually crushed by the
+    # tilt term (RMS ~10) — both terms share the same time base but get their
+    # own amplitude scale, coloured to match their trace.
+    ax_lin = axes[1]
+    ax_tilt = ax_lin.twinx()
+
+    l1, = ax_lin.plot(t[mask], linear[mask], lw=0.9, color="tab:orange",
+                      label=f"h_x(t) ⊛ w_x  (linear FIR, OU drift)  RMS={lin_rms:.2f}")
+    l2, = ax_tilt.plot(t[mask], d["coupling_tilt"][mask], lw=0.9, color="tab:red",
+                       label=f"C_tilt = T(t) · θ_y_proxy(t)  (bilinear)  RMS={tilt_rms:.2f}")
+
+    # Symmetric limits sized to each term's own peak excursion (with 15 % pad)
+    lin_lim = 1.15 * np.max(np.abs(linear[mask]))
+    tilt_lim = 1.15 * np.max(np.abs(d["coupling_tilt"][mask]))
+    ax_lin.set_ylim(-lin_lim, lin_lim)
+    ax_tilt.set_ylim(-tilt_lim, tilt_lim)
+
+    ax_lin.set_ylabel("Linear coupling", color="tab:orange")
+    ax_tilt.set_ylabel("Tilt coupling", color="tab:red")
+    ax_lin.tick_params(axis="y", labelcolor="tab:orange")
+    ax_tilt.tick_params(axis="y", labelcolor="tab:red")
+    ax_lin.axhline(0, color="grey", lw=0.5, alpha=0.5)
+
+    ax_lin.set_title(
+        f"Coupling anatomy — linear (OU-drifting) + tilt (bilinear)   "
+        f"[tilt/linear RMS ≈ {tilt_rms/lin_rms:.1f}×, separate y-axes]"
+    )
+    ax_lin.legend([l1, l2], [l1.get_label(), l2.get_label()],
+                  loc="upper right", fontsize=8)
+    ax_lin.grid(alpha=0.3)
 
     axes[2].plot(t[mask], d["main"][mask], lw=0.8, color="black",
                  label="main y(t)")
@@ -83,7 +110,8 @@ def plot_timedomain():
     axes[2].legend(loc="upper right", fontsize=8)
     axes[2].grid(alpha=0.3)
 
-    fig.suptitle("Toy setup: one episode, first 60 s", y=1.00, fontsize=11)
+    fig.suptitle("Toy setup: one episode, 60–120 s (after FIR warm-up)",
+                 y=1.00, fontsize=11)
     fig.tight_layout()
     _save(fig, "toy_setup_timedomain.png")
 
