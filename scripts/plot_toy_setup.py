@@ -69,36 +69,18 @@ def plot_timedomain():
     lin_rms = float(np.sqrt(np.mean(linear**2)))
     tilt_rms = float(np.sqrt(np.mean(d["coupling_tilt"]**2)))
 
-    # Twin y-axes so the linear term (RMS ~1.8) is not visually crushed by the
-    # tilt term (RMS ~10) — both terms share the same time base but get their
-    # own amplitude scale, coloured to match their trace.
-    ax_lin = axes[1]
-    ax_tilt = ax_lin.twinx()
-
-    l1, = ax_lin.plot(t[mask], linear[mask], lw=0.9, color="tab:orange",
-                      label=f"h_x(t) ⊛ w_x  (linear FIR, OU drift)  RMS={lin_rms:.2f}")
-    l2, = ax_tilt.plot(t[mask], d["coupling_tilt"][mask], lw=0.9, color="tab:red",
-                       label=f"C_tilt = T(t) · θ_y_proxy(t)  (bilinear)  RMS={tilt_rms:.2f}")
-
-    # Symmetric limits sized to each term's own peak excursion (with 15 % pad)
-    lin_lim = 1.15 * np.max(np.abs(linear[mask]))
-    tilt_lim = 1.15 * np.max(np.abs(d["coupling_tilt"][mask]))
-    ax_lin.set_ylim(-lin_lim, lin_lim)
-    ax_tilt.set_ylim(-tilt_lim, tilt_lim)
-
-    ax_lin.set_ylabel("Linear coupling", color="tab:orange")
-    ax_tilt.set_ylabel("Tilt coupling", color="tab:red")
-    ax_lin.tick_params(axis="y", labelcolor="tab:orange")
-    ax_tilt.tick_params(axis="y", labelcolor="tab:red")
-    ax_lin.axhline(0, color="grey", lw=0.5, alpha=0.5)
-
-    ax_lin.set_title(
+    axes[1].plot(t[mask], linear[mask], lw=0.9, color="tab:orange",
+                 label=f"h_x(t) ⊛ w_x  (linear FIR, OU drift)  RMS={lin_rms:.2f}")
+    axes[1].plot(t[mask], d["coupling_tilt"][mask], lw=0.9, color="tab:red",
+                 label=f"C_tilt = T(t) · θ_y_proxy(t)  (bilinear)  RMS={tilt_rms:.2f}")
+    axes[1].axhline(0, color="grey", lw=0.5, alpha=0.5)
+    axes[1].set_ylabel("Coupling term")
+    axes[1].set_title(
         f"Coupling anatomy — linear (OU-drifting) + tilt (bilinear)   "
-        f"[tilt/linear RMS ≈ {tilt_rms/lin_rms:.1f}×, separate y-axes]"
+        f"[tilt/linear RMS ≈ {tilt_rms/lin_rms:.1f}×]"
     )
-    ax_lin.legend([l1, l2], [l1.get_label(), l2.get_label()],
-                  loc="upper right", fontsize=8)
-    ax_lin.grid(alpha=0.3)
+    axes[1].legend(loc="upper right", fontsize=8)
+    axes[1].grid(alpha=0.3)
 
     axes[2].plot(t[mask], d["main"][mask], lw=0.8, color="black",
                  label="main y(t)")
@@ -106,7 +88,7 @@ def plot_timedomain():
                  alpha=0.9, label="sensor noise (oracle floor)")
     axes[2].set_xlabel("Time (s)")
     axes[2].set_ylabel("Obtaining channel")
-    axes[2].set_title("y(t) = h_x(t)⊛w_x(t) + C_tilt(t) + n_GS13X(t)")
+    axes[2].set_title("y(t) = h_x(t)⊛w_x(t) + C_tilt(t) + n(t)")
     axes[2].legend(loc="upper right", fontsize=8)
     axes[2].grid(alpha=0.3)
 
