@@ -178,8 +178,8 @@ def plot_sensor_colors():
 
     for ax, title in zip(
         axes,
-        [f"Broadband RMS = {sigma}\n(--sensor-noise-band unset)",
-         f"In-band RMS on {band} Hz = {sigma}\n(--sensor-noise-band 0.05 0.5)"],
+        [f"Broadband RMS = {sigma}",
+         f"In-band RMS on {band} Hz = {sigma}"],
     ):
         ax.axvspan(*band, color="grey", alpha=0.12)
         ax.set_xlabel("Frequency (Hz)")
