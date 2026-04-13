@@ -28,9 +28,13 @@ captured by additive zero-mean Gaussian noise n_GS13X(t) with RMS
     sensor_noise_exponent = 1.0 → pink    (1/f,  −3 dB/octave)
     sensor_noise_exponent = 2.0 → brown   (1/f², −6 dB/octave)
 
-The oracle (best achievable residual) is simply the RMS of this trace; its
-value is independent of the colour because ``_colored_noise`` renormalises
-the output to ``sensor_noise_sigma``.
+The oracle (best achievable residual) is simply the RMS of this trace; by
+default ``_colored_noise`` renormalises the output so its **broadband** RMS
+equals ``sensor_noise_sigma``.  Setting ``sensor_noise_band=(f_low, f_high)``
+switches the normalisation to the **in-band** RMS measured on
+[f_low, f_high] via Parseval's theorem — useful for steep spectra (α ≥ 2),
+where pinning the broadband RMS leaves most of the power near DC and
+underpopulates the microseismic evaluation band.
 
 Witness channels
 ----------------
@@ -170,6 +174,16 @@ class SeismicConfig:
     # noise floor comparable across colours.
     sensor_noise_sigma: float = 0.05     # GS13X-like sensor noise RMS (obtaining channel)
     sensor_noise_exponent: float = 0.0   # PSD ∝ 1/f^α; 0=white, 1=pink, 2=brown
+    # Optional (f_low, f_high) frequency window over which the sensor-noise
+    # RMS is enforced.  When None (default), ``sensor_noise_sigma`` is the
+    # broadband RMS.  When set, ``sensor_noise_sigma`` is interpreted as the
+    # in-band RMS measured on [f_low, f_high] via Parseval's theorem — this
+    # is the physically meaningful quantity for steep spectra (α ≥ 2), where
+    # the broadband RMS is dominated by near-DC power irrelevant to the
+    # seismic band.  Example: ``sensor_noise_band=(0.05, 0.5)`` pins the
+    # oracle floor inside the microseismic evaluation band regardless of
+    # ``sensor_noise_exponent``.
+    sensor_noise_band: Optional[Tuple[float, float]] = None
 
     # --- regime changes (sudden coupling path change) ---
     regime_changes: bool = False
@@ -311,49 +325,90 @@ def _colored_noise(
     exponent: float,
     fs: float,
     rng: np.random.Generator,
+    band: Optional[Tuple[float, float]] = None,
 ) -> np.ndarray:
     """
     Gaussian noise with power spectral density proportional to 1/f^exponent.
 
     Implementation: generate zero-mean unit-variance white Gaussian noise,
     scale its real-FFT magnitudes by 1/f^(exponent/2), inverse-transform and
-    renormalise so the output RMS equals ``sigma``.  The DC bin is zeroed,
-    which keeps the trace mean-free and avoids a 1/0 singularity.
+    renormalise so that either the broadband RMS or the RMS measured within
+    a chosen frequency window equals ``sigma``.  The DC bin is zeroed, which
+    keeps the trace mean-free and avoids a 1/0 singularity for α > 0.
 
     Parameters
     ----------
     n        : number of samples to generate
-    sigma    : target RMS of the output trace (same units as ``sensor_noise_sigma``)
+    sigma    : target RMS of the output trace.  Interpreted as **broadband**
+               RMS when ``band is None`` and as **in-band** RMS (measured on
+               [f_low, f_high]) when ``band`` is supplied.
     exponent : spectral exponent α.  Special values:
                   0  → white noise (flat PSD)
                   1  → pink / flicker noise (1/f,  −3 dB/octave)
                   2  → brown / red noise (1/f², −6 dB/octave, Brownian)
                Negative exponents give blue (−1) / violet (−2) noise.
-    fs       : sampling rate in Hz (only used to build the frequency axis;
-               with RMS renormalisation the exact frequency grid does not
-               change the resulting RMS, only the spectral shape)
+    fs       : sampling rate in Hz (sets the frequency grid used for spectral
+               shaping and for band-limited RMS measurement)
     rng      : numpy Generator
+    band     : optional ``(f_low, f_high)`` frequency window in Hz.  When
+               given, the trace is renormalised so its RMS restricted to
+               [f_low, f_high] equals ``sigma``, measured exactly via
+               Parseval's theorem on the rFFT bins that fall inside the band.
+               When ``None`` (default), the broadband RMS is normalised —
+               identical behaviour to the earlier version of this helper.
 
     Notes
     -----
-    For ``exponent == 0`` this falls back to ``rng.normal(0, sigma, n)``
-    unchanged, so the default behaviour is identical to the previous
-    white-noise sensor model.
+    For ``exponent == 0`` and ``band is None`` this short-circuits to
+    ``rng.normal(0, sigma, n)``, so the default behaviour is bit-identical
+    to the original white-noise sensor model.
+
+    Why Parseval and not a bandpass filter?  A Butterworth bandpass would
+    introduce transients and skirt leakage at the band edges, so the user's
+    later PSD measurement would not see exactly ``sigma`` inside the band.
+    The Parseval method sums the rFFT bin powers whose centre frequencies
+    fall inside [f_low, f_high] and weights them correctly for a real FFT
+    (DC and Nyquist count once, interior bins count twice), which matches
+    what ``scipy.signal.welch`` would report for the same window up to the
+    usual spectral-estimator variance.
     """
-    if exponent == 0.0:
+    if exponent == 0.0 and band is None:
         return rng.normal(0.0, sigma, n)
 
     white = rng.normal(0.0, 1.0, n)
     spec = np.fft.rfft(white)
     freqs = np.fft.rfftfreq(n, d=1.0 / fs)
 
-    scale = np.zeros_like(freqs)
-    nz = freqs > 0
-    scale[nz] = freqs[nz] ** (-exponent / 2.0)
+    if exponent != 0.0:
+        scale = np.zeros_like(freqs)
+        nz = freqs > 0
+        scale[nz] = freqs[nz] ** (-exponent / 2.0)
+        spec = spec * scale
 
-    colored = np.fft.irfft(spec * scale, n=n)
+    colored = np.fft.irfft(spec, n=n)
 
-    rms_val = np.sqrt(np.mean(colored**2))
+    if band is None:
+        rms_val = np.sqrt(np.mean(colored**2))
+    else:
+        f_low, f_high = band
+        if not (f_high > f_low >= 0.0):
+            raise ValueError(
+                f"sensor_noise_band must satisfy 0 ≤ f_low < f_high; got {band}"
+            )
+        # Parseval for the real FFT: mean-square contribution of each bin is
+        # weight·|X[k]|²/N², where weight = 1 for DC (and Nyquist when N is
+        # even) and 2 for all interior bins (which fold in their Hermitian
+        # conjugate).  Summing only the in-band bins gives the exact
+        # mean-square of the ideally bandpassed trace.
+        power = np.abs(spec) ** 2
+        weights = np.full_like(power, 2.0)
+        weights[0] = 1.0                        # DC bin
+        if n % 2 == 0:
+            weights[-1] = 1.0                   # Nyquist bin
+        mask = (freqs >= f_low) & (freqs <= f_high)
+        band_ms = float(np.sum(power[mask] * weights[mask]) / (n * n))
+        rms_val = np.sqrt(band_ms)
+
     if rms_val < 1e-12:
         return colored
     return (sigma / rms_val) * colored
@@ -488,12 +543,15 @@ class SeismicSignalSimulator:
         # --- GS13X sensor noise (obtaining channel) ---
         # Either white (exponent=0) or coloured (PSD ∝ 1/f^α); see
         # `_colored_noise` and `SeismicConfig.sensor_noise_exponent`.
+        # If ``sensor_noise_band`` is set, ``sensor_noise_sigma`` is enforced
+        # as the in-band RMS on that window instead of the broadband RMS.
         sensor_noise = _colored_noise(
             n,
             sigma=cfg.sensor_noise_sigma,
             exponent=cfg.sensor_noise_exponent,
             fs=cfg.fs,
             rng=self.rng,
+            band=cfg.sensor_noise_band,
         )
 
         # --- injected test signal (zero during training) ---

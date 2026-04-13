@@ -147,6 +147,10 @@ python train.py --dilated-conv --conv-layers 8 --conv-channels 64   # explicit d
 python train.py --sensor-noise-color pink          # 1/f
 python train.py --sensor-noise-color brown         # 1/f²
 python train.py --sensor-noise-exponent 0.5        # arbitrary α
+
+# Pin the oracle RMS inside a frequency window instead of broadband —
+# useful for steep spectra where broadband power sits near DC.
+python train.py --sensor-noise-color brown --sensor-noise-band 0.05 0.5
 ```
 
 Saves model to `models/ppo_noise_cancellation.zip` and VecNormalize stats to `models/ppo_noise_cancellation_vecnorm.pkl`.

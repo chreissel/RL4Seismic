@@ -387,6 +387,12 @@ def parse_args():
     p.add_argument("--sensor-noise-exponent", type=float, default=None,
                    help="Override --sensor-noise-color with a custom spectral "
                         "exponent α (PSD ∝ 1/f^α).")
+    p.add_argument("--sensor-noise-band", type=float, nargs=2,
+                   metavar=("F_LOW", "F_HIGH"), default=None,
+                   help="Optional (f_low, f_high) Hz window over which to "
+                        "enforce the sensor-noise RMS. When given, "
+                        "sensor_noise_sigma is interpreted as the in-band RMS "
+                        "on this window instead of the broadband RMS.")
     return p.parse_args()
 
 
@@ -400,11 +406,14 @@ def main():
         else color_to_exp[args.sensor_noise_color]
     )
 
+    sensor_band = tuple(args.sensor_noise_band) if args.sensor_noise_band else None
+
     cfg = SeismicConfig(
         drift=not args.no_drift,
         regime_changes=args.regime_changes,
         tilt_coupling=not args.no_tilt_coupling,
         sensor_noise_exponent=sensor_exp,
+        sensor_noise_band=sensor_band,
     )
 
     window_size = args.window_size if args.window_size is not None else cfg.filter_length
