@@ -154,8 +154,8 @@ def plot_sensor_colors():
     band = (0.05, 0.5)
     sigma = 0.05
     colours = [("white", 0.0, "tab:gray"),
-               ("pink",  1.0, "tab:orange"),
-               ("brown", 2.0, "tab:red")]
+               ("pink",  1.0, "hotpink"),
+               ("brown", 2.0, "saddlebrown")]
 
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.6), sharey=True)
 
