@@ -56,7 +56,7 @@ With `--tilt-coupling` (requires `--multi-source`), a physically motivated nonli
 C_T2L(t) = T(t) · θ_proxy(t) · w1(t)
 ```
 
-where `θ_proxy[t] = w2[t] − w2[t−1]` approximates ground tilt from Rayleigh waves and `T(t)` is an OU-drifting alignment gain. This **bilinear product of two channels cannot be cancelled by any linear filter** (LMS/NLMS), giving the RL agent a genuine advantage.
+where `θ_proxy(t)` is obtained by passing `w2` through a **double leaky integrator** (two cascaded first-order low-pass stages, τ ≈ 2 s) and `T(t)` is an OU-drifting alignment gain. The low-pass shape avoids the high-frequency PSD amplification of a naive finite-difference (`w2[t] − w2[t−1]`) proxy, since only low-frequency ground motion physically tilts the test masses. This **bilinear product of two channels cannot be cancelled by any linear filter** (LMS/NLMS), giving the RL agent a genuine advantage.
 
 ### Why closed-loop?
 

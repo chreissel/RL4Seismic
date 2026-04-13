@@ -32,19 +32,25 @@ Each has a small additive self-noise term.
 
 Tilt-horizontal coupling
 ------------------------
-Low-frequency seismic waves (Rayleigh waves) tilt the ground.  The Y-direction
-seismic motion creates a ground tilt about the X axis:
-
-    θ_y(t) ≈ (1/c_R) · dw_y/dt
-
-This tilt couples into the main channel via the alignment-dependent gain T(t):
+Low-frequency seismic waves (Rayleigh waves) tilt the ground and that tilt
+couples into the main channel via the alignment-dependent gain T(t):
 
     C_tilt(t) = T(t) · θ_y_proxy(t)
 
-where θ_y_proxy[t] = w_y[t] − w_y[t−1]  is a finite-difference
-approximation of dw_y/dt, and T(t) is the
-OU-drifting tilt-horizontal coupling gain representing the slowly changing
-mirror alignment.
+where θ_y_proxy(t) is a low-passed version of the Y witness obtained by
+passing w_y through a **double leaky integrator** (two cascaded first-order
+low-pass / leaky-integrator stages):
+
+    x1[t] = (1−α)·x1[t−1] + α·w_y[t]
+    θ_y_proxy[t] = (1−α)·θ_y_proxy[t−1] + α·x1[t]
+
+with α = 1 − exp(−Δt / τ_leak) and τ_leak = ``tilt_leak_timescale``.  This
+gives a bounded, smooth tilt proxy whose PSD rolls off as 1/ω⁴ at high
+frequency — avoiding the artificial high-frequency amplification of a
+finite-difference (≈ d/dt) proxy, which boosts the PSD above the
+microseismic band where tilt is not physically relevant.  T(t) is an
+OU-drifting alignment gain representing the slowly changing mirror
+alignment.
 
 For constant T, any linear adaptive filter can cancel C_tilt by learning the
 transfer function θ_y → main.  With drifting T(t) the filter must track the
@@ -153,18 +159,32 @@ class SeismicConfig:
     #
     #   C_tilt(t) = T(t) · θ_y_proxy(t)
     #
-    # where θ_y_proxy[t] = w_y[t] − w_y[t−1] is the first-difference of the
-    # Y seismometer (proxy for dw_y/dt ∝ tilt angle), and T(t) is the
+    # θ_y_proxy(t) is obtained by passing w_y through a **double leaky
+    # integrator** (two cascaded first-order low-pass / leaky-integrator
+    # stages with time constant ``tilt_leak_timescale``).  This gives a
+    # bounded, smooth tilt proxy whose PSD rolls off as 1/ω⁴ at high
+    # frequency, avoiding the high-frequency amplification of a naïve
+    # finite-difference (≈ d/dt) proxy, which inflates the PSD above the
+    # microseismic band where tilt is not physically relevant.  T(t) is the
     # OU-drifting alignment-dependent gain.
     #
     # With drift=True, T(t) is non-stationary (OU), so static linear filters
     # cannot fully cancel C_tilt without re-adapting.  With drift=False, T is
     # constant and a static linear filter CAN cancel C_tilt.
     tilt_coupling: bool = True
-    t2l_gain: float = 43.0              # mean tilt-horizontal coupling gain
-                                         # (acts on raw diff(w_y), not normalised;
-                                         #  T2L coupling RMS ≈ t2l_gain × 0.186 ≈ 8.0,
-                                         #  which dominates over linear coupling ≈ 0.5)
+    tilt_leak_timescale: float = 2.0    # seconds — time constant of each of the
+                                         # two cascaded leaky-integrator stages.
+                                         # 2 s ≈ 0.08 Hz corner, just below the
+                                         # 0.14 Hz secondary microseism peak:
+                                         # preserves in-band tilt energy while
+                                         # rolling off the high-frequency tail.
+    t2l_gain: float = 43.0              # mean tilt-horizontal coupling gain.
+                                         # Acts on the double-leaky-integrated
+                                         # witness_y (not normalised), so the
+                                         # resulting C_tilt RMS depends on
+                                         # tilt_leak_timescale.  With the
+                                         # defaults above C_tilt is tuned to
+                                         # dominate over linear coupling ≈ 0.5.
     t2l_gain_drift_sigma: float = 2.7   # OU fluctuation of T(t)
     t2l_thermal_timescale: float = 600.0 # seconds — alignment changes slowly
 
@@ -225,6 +245,41 @@ def _ou_process(
     for i in range(1, n):
         x[i] = exp_dt * x[i - 1] + (1.0 - exp_dt) * mean + raw_noise[i]
     return x
+
+
+def _double_leaky_integrator(
+    x: np.ndarray, timescale: float, fs: float
+) -> np.ndarray:
+    """
+    Apply two cascaded first-order leaky-integrator / low-pass stages:
+
+        y1[t] = (1−α)·y1[t−1] + α·x[t]
+        y2[t] = (1−α)·y2[t−1] + α·y1[t]
+
+    with α = 1 − exp(−Δt / τ), τ = ``timescale``.  The resulting filter has
+    unity DC gain and a 1/ω² magnitude rolloff per stage (1/ω⁴ cascaded) for
+    frequencies well above the corner f_c ≈ 1 / (2π·τ).
+
+    Used for the tilt-horizontal coupling proxy: the witness is smoothed with
+    a well-behaved low-pass instead of a high-pass-like finite difference, so
+    the resulting tilt proxy does not artificially amplify high frequencies in
+    its PSD — only the physically relevant low-frequency (microseismic) band
+    contributes meaningfully.
+    """
+    dt = 1.0 / fs
+    alpha = 1.0 - np.exp(-dt / timescale)
+    one_minus_alpha = 1.0 - alpha
+
+    y1 = np.empty_like(x)
+    y2 = np.empty_like(x)
+    y1_prev = 0.0
+    y2_prev = 0.0
+    for i in range(x.shape[0]):
+        y1_prev = one_minus_alpha * y1_prev + alpha * x[i]
+        y2_prev = one_minus_alpha * y2_prev + alpha * y1_prev
+        y1[i] = y1_prev
+        y2[i] = y2_prev
+    return y2
 
 
 def _seismic_ground_motion(
@@ -290,9 +345,9 @@ class SeismicSignalSimulator:
       - Tilt-horizontal coupling: Y seismic → ground tilt → main channel
 
     The tilt-horizontal coupling C_tilt(t) = T(t) · θ_y_proxy(t) is a bilinear
-    product of the slowly drifting alignment gain T(t) and the normalised
-    first-difference of witness_y (tilt proxy).  With drift=True, static linear
-    filters cannot track the drifting T(t); with drift=False they can.
+    product of the slowly drifting alignment gain T(t) and a double-leaky-
+    integrated version of witness_y (the tilt proxy).  With drift=True, static
+    linear filters cannot track the drifting T(t); with drift=False they can.
 
     Usage
     -----
@@ -490,21 +545,25 @@ class SeismicSignalSimulator:
 
         Physical mechanism
         ------------------
-        Rayleigh waves propagating along Y tilt the ground about the X axis.
-        For a Rayleigh wave with phase velocity c_R, the tilt angle is:
-
-            θ_y(ω) = (ω / c_R) · w_y(ω)   →   θ_y ≈ (1/c_R) · dw_y/dt
-
-        In the time domain this is approximated by a first-difference FIR:
-
-            θ_y_proxy[t] = w_y[t] − w_y[t−1]    (normalised to unit RMS)
-
-        The tilt θ_y couples into the main channel via the alignment-dependent
+        Rayleigh waves propagating along Y tilt the ground about the X axis,
+        and this tilt couples into the main channel via the alignment-dependent
         gain T(t), representing the mechanical lever arm between mirror tilt
-        and length noise (controlled by mirror angular alignment):
+        and length noise (controlled by mirror angular alignment).
 
-            C_tilt(t) = T(t) · θ_y_proxy(t)
+        Tilt proxy
+        ----------
+        θ_y_proxy(t) is obtained by passing witness_y through a **double
+        leaky integrator** — two cascaded first-order low-pass stages with
+        time constant ``tilt_leak_timescale`` (see `_double_leaky_integrator`).
+        The resulting filter has unity DC gain and a 1/ω⁴ magnitude rolloff
+        well above the corner frequency, which avoids the high-frequency PSD
+        amplification of a finite-difference (≈ d/dt) proxy.  Frequencies
+        above the microseismic band therefore contribute negligibly to the
+        tilt proxy — matching the physical observation that only low-frequency
+        ground motion tilts the test masses in a way that matters.
 
+        Drift
+        -----
         When config.drift=True, T(t) follows an Ornstein–Uhlenbeck process
         (mean = t2l_gain, σ = t2l_gain_drift_sigma), representing slow
         changes in mirror alignment.  Any static linear filter applied to
@@ -515,14 +574,14 @@ class SeismicSignalSimulator:
         """
         cfg = self.config
 
-        # --- tilt proxy: first-difference of Y seismometer (∝ dw_y/dt) ---
-        # No per-episode normalisation: C_tilt = T(t) · diff(w_y) directly.
+        # --- tilt proxy: double leaky integrator of the Y seismometer ---
+        # No per-episode normalisation: C_tilt = T(t) · tilt_proxy directly.
         # This ensures the coupling is a deterministic function of witness_y
         # and the coupling parameters, so offline methods (Wiener filter)
         # generalise across episodes without gain mismatch.
-        tilt_proxy = np.empty(n)
-        tilt_proxy[0] = 0.0
-        tilt_proxy[1:] = witness_y[1:] - witness_y[:-1]
+        tilt_proxy = _double_leaky_integrator(
+            witness_y, cfg.tilt_leak_timescale, cfg.fs
+        )
 
         # --- T(t): alignment-dependent coupling gain (drifts or fixed) ---
         if cfg.drift:

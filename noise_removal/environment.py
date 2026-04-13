@@ -14,10 +14,12 @@ Observation (3·W floats):
     [ witness_x[t-W+1..t],  witness_y[t-W+1..t],  residual[t-W..t-1] ]
 
 The witness_y window gives the agent the information needed to learn the
-tilt-horizontal coupling C_tilt(t) = T(t) · θ_y_proxy(t), which requires
-tracking the slowly drifting gain T(t).  Static linear adaptive filters
-(LMS/NLMS) must re-converge each time T(t) drifts; the RL agent can learn
-to anticipate T(t) changes from the residual history.
+tilt-horizontal coupling C_tilt(t) = T(t) · θ_y_proxy(t), where θ_y_proxy
+is a double-leaky-integrated version of witness_y (see
+`signals._tilt_horizontal_coupling`).  Cancelling C_tilt requires tracking
+the slowly drifting gain T(t).  Static linear adaptive filters (LMS/NLMS)
+must re-converge each time T(t) drifts; the RL agent can learn to
+anticipate T(t) changes from the residual history.
 """
 
 from __future__ import annotations
