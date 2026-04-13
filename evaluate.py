@@ -49,6 +49,36 @@ def rms(x: np.ndarray) -> float:
     return float(np.sqrt(np.mean(x**2)))
 
 
+def band_rms(x: np.ndarray, fs: float, band: tuple) -> float:
+    """
+    In-band RMS of ``x`` measured on ``[band[0], band[1]]`` Hz, computed
+    exactly via Parseval's theorem on the unwindowed real FFT.
+
+    This matches the normalisation used by ``_colored_noise`` in
+    ``noise_removal/signals.py`` bin-for-bin, so when the simulator is
+    configured with ``sensor_noise_band=band`` and ``sensor_noise_sigma=σ``
+    this routine reports ``σ`` for the oracle trace up to numerical noise.
+
+    For a real FFT, Hermitian symmetry folds the negative-frequency bins
+    onto the positive ones, so interior bins (0 < k < N/2) must be weighted
+    twice while DC and Nyquist are weighted once.
+    """
+    f_lo, f_hi = band
+    n = len(x)
+    spec = np.fft.rfft(x)
+    freqs = np.fft.rfftfreq(n, d=1.0 / fs)
+
+    power = np.abs(spec) ** 2
+    weights = np.full_like(power, 2.0)
+    weights[0] = 1.0
+    if n % 2 == 0:
+        weights[-1] = 1.0
+
+    mask = (freqs >= f_lo) & (freqs <= f_hi)
+    ms = float(np.sum(power[mask] * weights[mask]) / (n * n))
+    return float(np.sqrt(max(ms, 0.0)))
+
+
 def run_wiener(
     train_data: dict,
     eval_data: dict,
@@ -295,53 +325,86 @@ def plot_overview(
 
 
 def print_metrics(data, wiener_clean, iir_clean, rl_clean, lstm_clean=None,
-                  warmup_fraction: float = 0.25):
+                  warmup_fraction: float = 0.25,
+                  band: Optional[tuple] = None,
+                  fs: Optional[float] = None):
     """Print RMS metrics for all methods.
 
     Reports both full-episode and steady-state (after warmup) performance.
     Online adaptive filters (IIR) need time to converge; the steady-state
     metric excludes the initial convergence transient.  The Wiener filter
     has no transient (trained offline) so both columns should be similar.
+
+    When ``band`` is ``None`` the RMS is broadband (the full trace).  When
+    ``band = (f_lo, f_hi)`` is given, the RMS is the in-band power on that
+    window, computed via ``band_rms`` (Parseval-exact on the rFFT, matching
+    the simulator's ``sensor_noise_band`` convention).  ``fs`` must be
+    supplied together with ``band``.
     """
-    oracle_rms  = rms(data["sensor_noise"])
-    raw_rms     = rms(data["main"])
-    wiener_rms  = rms(wiener_clean)
-    iir_rms     = rms(iir_clean)
+    if band is None:
+        rms_fn = rms
+        scope_label = "broadband RMS"
+    else:
+        if fs is None:
+            raise ValueError("print_metrics(band=...) requires fs")
+        scope_label = f"in-band RMS on [{band[0]}, {band[1]}] Hz"
+        def rms_fn(x, _fs=fs, _band=band):
+            return band_rms(x, _fs, _band)
+
+    oracle_rms  = rms_fn(data["sensor_noise"])
+    raw_rms     = rms_fn(data["main"])
+    wiener_rms  = rms_fn(wiener_clean)
+    iir_rms     = rms_fn(iir_clean)
 
     n = len(data["main"])
     ss = int(n * warmup_fraction)  # steady-state start index
-    oracle_ss  = rms(data["sensor_noise"][ss:])
-    wiener_ss  = rms(wiener_clean[ss:])
-    iir_ss     = rms(iir_clean[ss:])
+    oracle_ss  = rms_fn(data["sensor_noise"][ss:])
+    wiener_ss  = rms_fn(wiener_clean[ss:])
+    iir_ss     = rms_fn(iir_clean[ss:])
 
-    print("\n" + "=" * 72)
-    print("  Performance summary")
-    print("=" * 72)
+    # Guard against divide-by-zero if the oracle has no power in the band
+    eps = 1e-12
+    def ratio(a, b):
+        return a / b if b > eps else float("nan")
+
+    print("\n" + "=" * 78)
+    print(f"  Performance summary — {scope_label}")
+    print("=" * 78)
     print(f"  {'Method':<30s}  {'Full episode':>14s}  {'Steady-state':>14s}")
     print(f"  {'':30s}  {'(x oracle)':>14s}  {'(x oracle, >' + f'{warmup_fraction:.0%})':>14s}")
-    print("-" * 72)
+    print("-" * 78)
     print(f"  Oracle (sensor noise floor)   : {oracle_rms:.4f}")
     if "coupling_tilt" in data:
-        tilt_rms = rms(data["coupling_tilt"])
-        linear_floor = float(np.sqrt(tilt_rms**2 + oracle_rms**2))
-        print(f"  Tilt-horizontal coupling RMS  : {tilt_rms:.4f}  ({tilt_rms/oracle_rms:.1f}x oracle)")
-    print(f"  Raw main channel              : {raw_rms/oracle_rms:6.1f}x")
-    print(f"  Wiener filter (offline)       : {wiener_rms/oracle_rms:6.1f}x{wiener_ss/oracle_ss:15.1f}x")
-    print(f"  IIR adaptive filter (online)  : {iir_rms/oracle_rms:6.1f}x{iir_ss/oracle_ss:15.1f}x")
+        tilt_rms = rms_fn(data["coupling_tilt"])
+        print(f"  Tilt-horizontal coupling RMS  : {tilt_rms:.4f}  "
+              f"({ratio(tilt_rms, oracle_rms):.1f}x oracle)")
+    print(f"  Raw main channel              : {ratio(raw_rms, oracle_rms):6.1f}x")
+    print(f"  Wiener filter (offline)       : "
+          f"{ratio(wiener_rms, oracle_rms):6.1f}x"
+          f"{ratio(wiener_ss, oracle_ss):15.1f}x")
+    print(f"  IIR adaptive filter (online)  : "
+          f"{ratio(iir_rms, oracle_rms):6.1f}x"
+          f"{ratio(iir_ss, oracle_ss):15.1f}x")
     if lstm_clean is not None:
-        lstm_rms = rms(lstm_clean)
-        lstm_ss  = rms(lstm_clean[ss:])
-        print(f"  Supervised LSTM               : {lstm_rms/oracle_rms:6.1f}x{lstm_ss/oracle_ss:15.1f}x")
+        lstm_rms = rms_fn(lstm_clean)
+        lstm_ss  = rms_fn(lstm_clean[ss:])
+        print(f"  Supervised LSTM               : "
+              f"{ratio(lstm_rms, oracle_rms):6.1f}x"
+              f"{ratio(lstm_ss, oracle_ss):15.1f}x")
     if rl_clean is not None:
-        rl_rms = rms(rl_clean)
-        rl_ss  = rms(rl_clean[ss:])
+        rl_rms = rms_fn(rl_clean)
+        rl_ss  = rms_fn(rl_clean[ss:])
         beats = ""
         if "coupling_tilt" in data:
-            linear_floor = float(np.sqrt(rms(data["coupling_tilt"])**2 + oracle_rms**2))
+            linear_floor = float(
+                np.sqrt(rms_fn(data["coupling_tilt"]) ** 2 + oracle_rms ** 2)
+            )
             if rl_rms < linear_floor:
                 beats = " *** BEATS LINEAR FLOOR ***"
-        print(f"  RL agent (RecurrentPPO)       : {rl_rms/oracle_rms:6.1f}x{rl_ss/oracle_ss:15.1f}x{beats}")
-    print("=" * 72)
+        print(f"  RL agent (RecurrentPPO)       : "
+              f"{ratio(rl_rms, oracle_rms):6.1f}x"
+              f"{ratio(rl_ss, oracle_ss):15.1f}x{beats}")
+    print("=" * 78)
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +456,19 @@ def parse_args():
                         "enforce the sensor-noise RMS. When given, "
                         "sensor_noise_sigma is interpreted as the in-band RMS "
                         "on this window instead of the broadband RMS.")
+    p.add_argument("--eval-band", type=float, nargs=2,
+                   metavar=("F_LOW", "F_HIGH"), default=(0.05, 0.5),
+                   help="Frequency window (Hz) used for the band-limited RMS "
+                        "summary (default: 0.05 0.5 Hz — the microseismic "
+                        "evaluation band).  In addition to the broadband "
+                        "table, evaluate.py always prints a second summary "
+                        "with every RMS measured on this band (Parseval on "
+                        "the rFFT, matching the simulator's normalisation). "
+                        "Pass the same window as --sensor-noise-band to have "
+                        "the oracle come out equal to sensor_noise_sigma.")
+    p.add_argument("--no-eval-band", action="store_true",
+                   help="Skip the band-limited RMS summary and print only "
+                        "the broadband table.")
     return p.parse_args()
 
 
@@ -485,7 +561,20 @@ def main():
             print(f"No model found at {model_zip} — run  python train.py  first.")
             print("Proceeding without RL agent.")
 
+    # Broadband summary (the full-trace RMS — what the agent actually minimises)
     print_metrics(data, wiener_clean, iir_clean, rl_clean, lstm_clean=lstm_clean)
+
+    # Band-limited summary (the in-band RMS — what matters for the seismic
+    # evaluation window and what pairs naturally with --sensor-noise-band).
+    if not args.no_eval_band:
+        eval_band = tuple(args.eval_band)
+        print_metrics(
+            data, wiener_clean, iir_clean, rl_clean,
+            lstm_clean=lstm_clean,
+            band=eval_band,
+            fs=cfg.fs,
+        )
+
     plot_overview(
         data, wiener_clean, iir_clean, rl_clean,
         save_dir=args.save_dir, fs=cfg.fs,
