@@ -138,7 +138,7 @@ def parse_args():
     p.add_argument("--learning-rate", type=float, default=3e-4)
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--buffer-size", type=int, default=200_000)
-    p.add_argument("--train-freq", type=int, default=1)
+    p.add_argument("--train-freq", type=int, default=4)
     p.add_argument("--gradient-steps", type=int, default=1)
     p.add_argument("--learning-starts", type=int, default=1_000)
 
@@ -148,6 +148,8 @@ def parse_args():
     p.add_argument("--save-path", default="models/sac_bilinear")
     p.add_argument("--checkpoint-freq", type=int, default=0,
                    help="Save checkpoint every N steps (0 = disabled).")
+    p.add_argument("--log-interval", type=int, default=1,
+                   help="SAC log_interval in episodes (default 1 = every episode).")
     return p.parse_args()
 
 
@@ -207,7 +209,11 @@ def main():
             name_prefix=os.path.basename(args.save_path),
         ))
 
-    model.learn(total_timesteps=args.timesteps, callback=callbacks if callbacks else None)
+    model.learn(
+        total_timesteps=args.timesteps,
+        callback=callbacks if callbacks else None,
+        log_interval=args.log_interval,
+    )
 
     model.save(args.save_path)
     vec_env.save(args.save_path + "_vecnorm.pkl")
