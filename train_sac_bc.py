@@ -67,6 +67,7 @@ import torch
 import torch.nn.functional as F
 import gymnasium as gym
 from stable_baselines3 import SAC
+from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
@@ -477,6 +478,13 @@ def parse_args():
     p.add_argument("--seed", type=int, default=2)
     p.add_argument("--save-path", default="models/sac_bilinear_bc")
     p.add_argument("--log-interval", type=int, default=1)
+    p.add_argument("--checkpoint-freq", type=int, default=10_000,
+                   help="Save an intermediate checkpoint every N env steps of "
+                        "the RL phase (default 10000; set to 0 to disable).  "
+                        "Each checkpoint writes <save_path>_<steps>_steps.zip "
+                        "(model) and <save_path>_vecnormalize_<steps>_steps.pkl "
+                        "(VecNormalize stats) so every intermediate model can "
+                        "be evaluated independently with scripts/rl_showcase.py.")
     p.add_argument("--device", default="auto",
                    help="torch device ('auto', 'cpu', 'cuda', 'cuda:1', ...).")
     return p.parse_args()
@@ -606,9 +614,23 @@ def main():
     # =========================================================================
     # Phase 3: SAC RL training
     # =========================================================================
+    callbacks = []
+    if args.checkpoint_freq > 0:
+        callbacks.append(CheckpointCallback(
+            save_freq=args.checkpoint_freq,
+            save_path=os.path.dirname(args.save_path) or ".",
+            name_prefix=os.path.basename(args.save_path),
+            save_vecnormalize=True,
+        ))
+        print(f"  Checkpoints    : every {args.checkpoint_freq:,} steps → "
+              f"{os.path.dirname(args.save_path) or '.'}/"
+              f"{os.path.basename(args.save_path)}_<steps>_steps.zip "
+              f"(+ _vecnormalize_<steps>_steps.pkl)")
+
     print(f"\n[3/3] SAC RL training for {args.timesteps:,} steps…")
     model.learn(
         total_timesteps=args.timesteps,
+        callback=callbacks if callbacks else None,
         log_interval=args.log_interval,
     )
 

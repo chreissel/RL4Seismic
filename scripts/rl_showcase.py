@@ -114,6 +114,36 @@ def run_ekf(data, cfg):
                     witness_y=data["witness_y"])
 
 
+def _resolve_vecnorm_path(model_path: str) -> str:
+    """
+    Find the VecNormalize file that goes with a trained SAC model.
+
+    Supports two conventions:
+
+      * Final model              : ``<save_path>_vecnorm.pkl``
+      * CheckpointCallback output: ``<prefix>_vecnormalize_<steps>_steps.pkl``
+        (where ``model_path`` is ``<prefix>_<steps>_steps``)
+
+    Raises ``FileNotFoundError`` if neither exists.
+    """
+    import re as _re
+
+    candidates = [model_path + "_vecnorm.pkl"]
+    m = _re.search(r"_(\d+)_steps$", model_path)
+    if m:
+        steps = m.group(1)
+        prefix = model_path[: model_path.rindex(f"_{steps}_steps")]
+        candidates.append(f"{prefix}_vecnormalize_{steps}_steps.pkl")
+
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    raise FileNotFoundError(
+        f"No VecNormalize file found for model '{model_path}'. "
+        f"Tried: {candidates}"
+    )
+
+
 def run_sac_agent(data, cfg, model_path: str, window_size: int) -> np.ndarray:
     """
     Roll out a trained SAC agent sample-by-sample on the pre-generated data.
@@ -123,7 +153,7 @@ def run_sac_agent(data, cfg, model_path: str, window_size: int) -> np.ndarray:
     from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
     model = SAC.load(model_path + ".zip")
-    vecnorm_path = model_path + "_vecnorm.pkl"
+    vecnorm_path = _resolve_vecnorm_path(model_path)
 
     n = len(data["time"])
     cleaned = data["main"].copy()
@@ -403,10 +433,16 @@ def main():
 
     if not args.no_rl:
         model_zip = args.model_path + ".zip"
-        vecnorm = args.model_path + "_vecnorm.pkl"
-        if os.path.exists(model_zip) and os.path.exists(vecnorm):
-            print(f"Running SAC from {model_zip}…")
-            cleaned["SAC"] = run_sac_agent(data, cfg, args.model_path, args.window_size)
+        if os.path.exists(model_zip):
+            try:
+                _resolve_vecnorm_path(args.model_path)
+            except FileNotFoundError as e:
+                print(f"[warn] {e}  — skipping RL.")
+            else:
+                print(f"Running SAC from {model_zip}…")
+                cleaned["SAC"] = run_sac_agent(
+                    data, cfg, args.model_path, args.window_size
+                )
         else:
             print(f"[warn] SAC model not found at {model_zip}, skipping RL.")
 
