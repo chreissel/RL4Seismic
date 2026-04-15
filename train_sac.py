@@ -26,13 +26,40 @@ Key design choices:
     a small penalty  λ·(a_t − a_{t-1})²  to the reward inside a Gym
     wrapper.  Seismic control tasks benefit from smooth actuator outputs.
 
+  - **Band-limited reward (``--freq-reward``, on by default)**.  The env
+    computes reward on the bandpass-filtered residual only, so the training
+    signal is concentrated on the microseismic [0.05, 0.5] Hz band.  With
+    brownian sensor noise this is essential: a broadband reward is
+    dominated by uncancelable 1/f^2 power near DC, which drowns out the
+    useful in-band gradient and causes the policy to converge to a
+    "do-small-actions" local optimum below the no-op baseline.
+
+  - **Tighter action clip (``--action-clip 15``)**.  With y_t ~ 10-20 the
+    default ±40 range wastes half the action space on damaging magnitudes
+    and slows convergence.
+
+  - **Softer target entropy (``--target-entropy -0.2``)**.  SAC's default
+    ``-dim(A)=-1`` drove the auto-tuned entropy coefficient from 1.0 to
+    ~7e-4 in 10 episodes, collapsing exploration before the policy found
+    the canceling regime.  -0.2 keeps more exploration during training.
+
 Usage
 -----
     # Short smoke run (quick pipeline check)
     python train_sac.py --timesteps 20_000 --episode-duration 180
 
-    # Full training run
-    python train_sac.py --timesteps 1_000_000 --episode-duration 600
+    # Full training run -- Option A recommended config
+    python train_sac.py --timesteps 200_000 --episode-duration 600 \\
+        --no-dr --drift-scale 2.0 \\
+        --conv-channels 24 --conv-layers 6 --bilinear-rank 16 \\
+        --features-dim 192 --batch-size 256 \\
+        --train-freq 1 --gradient-steps 1 \\
+        --save-path models/sac_bilinear_option_a
+
+Option A fixes vs. the vanilla run:
+  * freq_reward=True             (band-limited reward on microseismic band)
+  * action_clip=15               (down from 40)
+  * target_entropy=-0.2          (softer than SAC default -1)
 """
 
 from __future__ import annotations
@@ -96,6 +123,10 @@ def make_env(args, seed: int):
                 config=cfg,
                 window_size=args.window_size,
                 episode_duration=args.episode_duration,
+                action_clip=args.action_clip,
+                freq_reward=args.freq_reward,
+                freq_band_low=args.freq_band_low,
+                freq_band_high=args.freq_band_high,
             )
         else:
             dr = DomainRandomizationConfig(
@@ -107,7 +138,34 @@ def make_env(args, seed: int):
                 dr_config=dr,
                 window_size=args.window_size,
                 episode_duration=args.episode_duration,
+                action_clip=args.action_clip,
             )
+            # The DR wrapper rebuilds the inner env on every reset, so we
+            # need to ensure the underlying NoiseCancellationEnv also gets
+            # the freq_reward flag.  Patch the thunk by wrapping reset:
+            if args.freq_reward:
+                _inner_reset = env.reset
+
+                def _reset_with_freq_reward(*a, **kw):
+                    obs, info = _inner_reset(*a, **kw)
+                    # Re-instantiate the inner env with freq_reward=True
+                    # using the config already sampled by the DR wrapper
+                    inner = env._inner
+                    inner.freq_reward = True
+                    from scipy.signal import butter, sosfilt_zi
+                    fs = inner.config.fs
+                    nyq = fs / 2.0
+                    low = max(args.freq_band_low, 0.01)
+                    high = min(args.freq_band_high, nyq * 0.99)
+                    inner._bp_sos = butter(
+                        4, [low, high], btype="bandpass", fs=fs, output="sos"
+                    )
+                    zi_template = sosfilt_zi(inner._bp_sos)
+                    inner._bp_zi_y = zi_template * 0.0
+                    inner._bp_zi_e = zi_template * 0.0
+                    return obs, info
+
+                env.reset = _reset_with_freq_reward
         env = ActionSmoothnessWrapper(env, smoothness_lambda=args.smoothness_lambda)
         env = Monitor(env)
         env.reset(seed=seed)
@@ -143,6 +201,28 @@ def parse_args():
     p.add_argument("--learning-starts", type=int, default=1_000)
 
     p.add_argument("--smoothness-lambda", type=float, default=0.01)
+
+    # --- Option A fixes: clean reward signal + tighter action + softer entropy ---
+    p.add_argument("--action-clip", type=float, default=15.0,
+                   help="Symmetric action bound (default 15.0, reduced from 40.0 "
+                        "so exploration stays in a sensible range given y_t ~ 10-20).")
+    p.add_argument("--freq-reward", action="store_true", default=True,
+                   help="Use band-limited reward on [freq_band_low, freq_band_high] "
+                        "Hz instead of broadband y_t^2 - e_t^2.  This is critical "
+                        "under brownian sensor noise: broadband reward is dominated "
+                        "by uncancelable low-frequency 1/f^2 power, which drowns out "
+                        "the useful in-band gradient signal (default: on).")
+    p.add_argument("--no-freq-reward", dest="freq_reward", action="store_false",
+                   help="Disable band-limited reward (fall back to broadband).")
+    p.add_argument("--freq-band-low", type=float, default=0.05)
+    p.add_argument("--freq-band-high", type=float, default=0.5)
+
+    p.add_argument("--target-entropy", type=float, default=-0.2,
+                   help="SAC target entropy.  Default -0.2 (softer than SAC's "
+                        "default -dim(A)=-1), which keeps more exploration and "
+                        "prevents the entropy coefficient from collapsing to ~1e-3 "
+                        "within 10 episodes before the policy has found the "
+                        "cancelling regime.  Set to -1.0 to match SAC default.")
 
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--save-path", default="models/sac_bilinear")
@@ -188,6 +268,7 @@ def main():
         train_freq=args.train_freq,
         gradient_steps=args.gradient_steps,
         learning_starts=args.learning_starts,
+        target_entropy=args.target_entropy,
         seed=args.seed,
         verbose=1,
         device="auto",
@@ -200,6 +281,11 @@ def main():
           f"bilinear_rank={args.bilinear_rank})")
     print(f"  Domain randomisation: "
           f"{'OFF (drift_scale=' + str(args.drift_scale) + ')' if args.no_dr else 'ON'}")
+    print(f"  Reward          : "
+          f"{'band-limited [' + str(args.freq_band_low) + ', ' + str(args.freq_band_high) + '] Hz' if args.freq_reward else 'broadband y_t^2 - e_t^2'}")
+    print(f"  Action clip     : [-{args.action_clip}, +{args.action_clip}]")
+    print(f"  Target entropy  : {args.target_entropy}  "
+          f"(SAC default would be -dim(A)=-1.0)")
 
     callbacks = []
     if args.checkpoint_freq > 0:
