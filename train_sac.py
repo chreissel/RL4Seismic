@@ -226,8 +226,13 @@ def parse_args():
 
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--save-path", default="models/sac_bilinear")
-    p.add_argument("--checkpoint-freq", type=int, default=0,
-                   help="Save checkpoint every N steps (0 = disabled).")
+    p.add_argument("--checkpoint-freq", type=int, default=10_000,
+                   help="Save an intermediate checkpoint every N env steps "
+                        "(default 10000; set to 0 to disable).  Each checkpoint "
+                        "writes <save_path>_<steps>_steps.zip (model) and "
+                        "<save_path>_vecnormalize_<steps>_steps.pkl (VecNormalize "
+                        "stats) so every intermediate model can be evaluated "
+                        "independently with scripts/rl_showcase.py.")
     p.add_argument("--log-interval", type=int, default=1,
                    help="SAC log_interval in episodes (default 1 = every episode).")
     return p.parse_args()
@@ -293,7 +298,12 @@ def main():
             save_freq=args.checkpoint_freq,
             save_path=os.path.dirname(args.save_path) or ".",
             name_prefix=os.path.basename(args.save_path),
+            save_vecnormalize=True,
         ))
+        print(f"  Checkpoints    : every {args.checkpoint_freq:,} steps → "
+              f"{os.path.dirname(args.save_path) or '.'}/"
+              f"{os.path.basename(args.save_path)}_<steps>_steps.zip "
+              f"(+ _vecnormalize_<steps>_steps.pkl)")
 
     model.learn(
         total_timesteps=args.timesteps,
