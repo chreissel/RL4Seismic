@@ -175,6 +175,9 @@ def parse_args():
 
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--save-path", default="models/mpo_bilinear")
+    p.add_argument("--checkpoint-freq", type=int, default=10_000,
+                   help="Save intermediate checkpoint every N env steps "
+                        "(default 10000; 0 to disable)")
     p.add_argument("--log-interval", type=int, default=1)
     p.add_argument("--device", type=str, default="auto")
     return p.parse_args()
@@ -241,12 +244,19 @@ def main():
     print(f"  K={args.n_action_samples} action samples, γ={args.gamma}, τ={args.tau}")
     print(f"  Device          : {model.device}")
 
+    if args.checkpoint_freq > 0:
+        print(f"  Checkpoints     : every {args.checkpoint_freq:,} steps → "
+              f"{os.path.dirname(args.save_path) or '.'}/"
+              f"{os.path.basename(args.save_path)}_<steps>_steps.zip")
+
     model.learn(
         total_timesteps=args.timesteps,
         env=vec_env,
         vec_normalize=vec_env,
         log_interval=args.log_interval,
         verbose=1,
+        checkpoint_freq=args.checkpoint_freq,
+        checkpoint_path=args.save_path,
     )
 
     model.save(args.save_path)

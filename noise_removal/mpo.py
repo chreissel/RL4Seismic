@@ -437,6 +437,8 @@ class MPO:
         callback=None,
         log_interval: int = 1,
         verbose: int = 1,
+        checkpoint_freq: int = 0,
+        checkpoint_path: str | None = None,
     ):
         """Train for ``total_timesteps`` environment steps.
 
@@ -447,12 +449,17 @@ class MPO:
         callback : optional callable(locals, globals) called each episode end
         log_interval : print episode stats every N episodes
         verbose : verbosity level (0=silent, 1=episode logs)
+        checkpoint_freq : save a checkpoint every N env steps (0 = disabled)
+        checkpoint_path : base path for checkpoints; files are saved as
+            ``<checkpoint_path>_<steps>_steps.zip`` (model) and
+            ``<checkpoint_path>_vecnormalize_<steps>_steps.pkl`` (VecNormalize).
         """
         obs = env.reset()
         episode_reward = 0.0
         episode_length = 0
         n_episodes = 0
         ep_rewards: list[float] = []
+        next_checkpoint = checkpoint_freq if checkpoint_freq > 0 else total_timesteps + 1
 
         for step in range(total_timesteps):
             self.num_timesteps = step + 1
@@ -506,6 +513,16 @@ class MPO:
             if step >= self.learning_starts and step % self.train_freq == 0:
                 for _ in range(self.gradient_steps):
                     self.train_step()
+
+            # Checkpoint
+            if self.num_timesteps >= next_checkpoint and checkpoint_path is not None:
+                ckpt = f"{checkpoint_path}_{self.num_timesteps}_steps"
+                self.save(ckpt)
+                if vec_normalize is not None:
+                    vec_normalize.save(f"{checkpoint_path}_vecnormalize_{self.num_timesteps}_steps.pkl")
+                if verbose >= 1:
+                    print(f"  [checkpoint] saved {ckpt}.zip")
+                next_checkpoint += checkpoint_freq
 
         return self
 
