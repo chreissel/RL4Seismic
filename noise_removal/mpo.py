@@ -40,6 +40,7 @@ and ``VecNormalize``.
 from __future__ import annotations
 
 import copy
+from collections import deque
 from typing import Optional
 
 import numpy as np
@@ -216,6 +217,7 @@ class MPO:
         n_action_samples: int = 64,
         gamma: float = 0.999,
         tau: float = 0.005,
+        n_step: int = 3,
         batch_size: int = 256,
         buffer_size: int = 200_000,
         learning_starts: int = 1000,
@@ -238,6 +240,8 @@ class MPO:
 
         self.gamma = gamma
         self.tau = tau
+        self.n_step = n_step
+        self._gamma_n = gamma ** n_step
         self.batch_size = batch_size
         self.buffer_size = buffer_size
         self.learning_starts = learning_starts
@@ -342,7 +346,7 @@ class MPO:
             next_mean, _ = self.actor_target(next_obs)
             next_actions = next_mean.clamp(self._act_low, self._act_high)
             q_target = self.critic_target.min_q(next_obs, next_actions)
-            td_target = rewards + self.gamma * (1.0 - dones) * q_target
+            td_target = rewards + self._gamma_n * (1.0 - dones) * q_target
 
         q1, q2 = self.critic(obs, actions)
         critic_loss = F.mse_loss(q1, td_target) + F.mse_loss(q2, td_target)
@@ -493,13 +497,37 @@ class MPO:
         n_episodes = 0
         ep_rewards: list[float] = []
         next_checkpoint = checkpoint_freq if checkpoint_freq > 0 else total_timesteps + 1
-        # Track unnormalized obs for replay buffer storage
-        _last_original_obs = vec_normalize.get_original_obs() if vec_normalize is not None else obs.copy()
+
+        def _get_orig():
+            return vec_normalize.get_original_obs() if vec_normalize is not None else obs.copy()
+
+        _last_original_obs = _get_orig()
+
+        # N-step return accumulator: each entry is
+        # (obs_orig, next_obs_orig, action, reward_scalar, done_bool, info)
+        n_step_buf: list = []
+
+        def _flush_n_step(force_all: bool = False):
+            """Compute n-step returns and add to replay buffer."""
+            while len(n_step_buf) >= self.n_step or (force_all and n_step_buf):
+                n = min(len(n_step_buf), self.n_step)
+                R = 0.0
+                for i in reversed(range(n)):
+                    r_i = n_step_buf[i][3]
+                    d_i = n_step_buf[i][4]
+                    R = r_i + self.gamma * R * (1.0 - float(d_i))
+                first = n_step_buf[0]
+                last = n_step_buf[n - 1]
+                self.replay_buffer.add(
+                    first[0], last[1], first[2],
+                    np.array([[R]]), np.array([[float(last[4])]]),
+                    [last[5]],
+                )
+                n_step_buf.pop(0)
 
         for step in range(total_timesteps):
             self.num_timesteps = step + 1
 
-            # Select action (obs is already normalized by VecNormalize)
             if step < self.learning_starts:
                 action = np.array([self.action_space.sample()])
             else:
@@ -508,16 +536,20 @@ class MPO:
                 action = np.array([action])
 
             new_obs, reward, done, info = env.step(action)
-
-            # Store unnormalized obs in the replay buffer.  sample(env=vec_normalize)
-            # will normalize them on the fly during training, ensuring train/inference
-            # distributions match.
             new_original_obs = vec_normalize.get_original_obs() if vec_normalize is not None else new_obs.copy()
-            self.replay_buffer.add(
-                _last_original_obs, new_original_obs, action, reward, done,
-                [info[0]] if isinstance(info, list) else [info],
-            )
+
+            info_single = info[0] if isinstance(info, list) else info
+            n_step_buf.append((
+                _last_original_obs, new_original_obs, action,
+                float(reward[0]), bool(done[0]), info_single,
+            ))
             _last_original_obs = new_original_obs
+
+            # Flush complete n-step transitions (or all on episode end)
+            if done[0]:
+                _flush_n_step(force_all=True)
+            else:
+                _flush_n_step(force_all=False)
 
             obs = new_obs
             episode_reward += float(reward[0])
@@ -537,7 +569,7 @@ class MPO:
                 episode_reward = 0.0
                 episode_length = 0
                 obs = env.reset()
-                _last_original_obs = vec_normalize.get_original_obs() if vec_normalize is not None else obs.copy()
+                _last_original_obs = _get_orig()
 
                 if callback is not None:
                     callback(locals(), globals())
