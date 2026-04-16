@@ -292,6 +292,9 @@ class MPO:
             device=self.device, n_envs=1,
         )
 
+        # VecNormalize reference (set during learn()) for replay buffer sampling
+        self._vec_normalize = None
+
         self.num_timesteps = 0
         self._n_updates = 0
 
@@ -326,7 +329,7 @@ class MPO:
 
     def train_step(self):
         """One gradient update: critic + E-step + M-step + dual update."""
-        data = self.replay_buffer.sample(self.batch_size)
+        data = self.replay_buffer.sample(self.batch_size, env=self._vec_normalize)
         obs = data.observations
         actions = data.actions
         rewards = data.rewards.squeeze(-1)
@@ -335,8 +338,9 @@ class MPO:
 
         # ---------- Critic update (TD target with target actor + target critic) ----------
         with torch.no_grad():
-            next_actions = self.actor_target.sample(next_obs, n=1).squeeze(1)
-            next_actions = next_actions.clamp(self._act_low, self._act_high)
+            # Use deterministic mean for TD target (lower variance than single sample)
+            next_mean, _ = self.actor_target(next_obs)
+            next_actions = next_mean.clamp(self._act_low, self._act_high)
             q_target = self.critic_target.min_q(next_obs, next_actions)
             td_target = rewards + self.gamma * (1.0 - dones) * q_target
 
@@ -358,26 +362,25 @@ class MPO:
             act_flat = sampled_actions.reshape(B * K, A)
             q_values = self.critic_target.min_q(obs_rep, act_flat).reshape(B, K)
 
-            # Normalize Q-values per state (zero-mean, unit-variance) so η
-            # controls relative sharpness regardless of the Q-value scale.
-            # This is the proper fix for η collapse — without it, η must
-            # track the growing Q-spread and eventually hits zero.
             q_mean = q_values.mean(dim=1, keepdim=True)
             q_std = q_values.std(dim=1, keepdim=True).clamp(min=1e-6)
             q_normalized = (q_values - q_mean) / q_std
 
-        # Solve for temperature η on the normalized Q-values (per-batch)
         eta = self._solve_eta(q_normalized)
 
-        # Compute normalised weights w_k = softmax(Q_norm_k / η)
         with torch.no_grad():
             weights = F.softmax(q_normalized / eta, dim=1)  # (B, K)
 
         # ---------- M-step: weighted MLE with KL constraints ----------
+        # Snapshot old policy params BEFORE the gradient step.
+        # We detach and clone to get a true "old" reference.
         with torch.no_grad():
             old_mean, old_log_std = self.actor(obs)
+            old_mean = old_mean.clone()
+            old_log_std = old_log_std.clone()
             old_std = old_log_std.exp()
 
+        # Forward pass through actor (will receive gradients)
         new_mean, new_log_std = self.actor(obs)
         new_std = new_log_std.exp()
 
@@ -386,7 +389,8 @@ class MPO:
         log_probs = new_dist.log_prob(sampled_actions).sum(dim=-1)  # (B, K)
         policy_loss = -(weights.detach() * log_probs).sum(dim=1).mean()
 
-        # Decoupled KL constraints
+        # Decoupled KL constraints (will be non-zero after optimizer.step
+        # updates the params; on first call they're zero but α adapts)
         kl_mean = 0.5 * (((new_mean - old_mean) / old_std) ** 2).sum(dim=-1).mean()
         var_ratio = (old_std / new_std) ** 2
         kl_var = 0.5 * (var_ratio + 2 * (new_log_std - old_log_std) - 1).sum(dim=-1).mean()
@@ -482,17 +486,20 @@ class MPO:
             ``<checkpoint_path>_<steps>_steps.zip`` (model) and
             ``<checkpoint_path>_vecnormalize_<steps>_steps.pkl`` (VecNormalize).
         """
+        self._vec_normalize = vec_normalize
         obs = env.reset()
         episode_reward = 0.0
         episode_length = 0
         n_episodes = 0
         ep_rewards: list[float] = []
         next_checkpoint = checkpoint_freq if checkpoint_freq > 0 else total_timesteps + 1
+        # Track unnormalized obs for replay buffer storage
+        _last_original_obs = vec_normalize.get_original_obs() if vec_normalize is not None else obs.copy()
 
         for step in range(total_timesteps):
             self.num_timesteps = step + 1
 
-            # Select action
+            # Select action (obs is already normalized by VecNormalize)
             if step < self.learning_starts:
                 action = np.array([self.action_space.sample()])
             else:
@@ -500,19 +507,17 @@ class MPO:
                 action = self.predict(obs_np, deterministic=False)
                 action = np.array([action])
 
-            # Step environment
             new_obs, reward, done, info = env.step(action)
 
-            # Store transition (with unnormalised obs if VecNormalize is used)
-            real_obs = obs
-            real_new_obs = new_obs
-            if vec_normalize is not None:
-                real_obs = vec_normalize.get_original_obs()
-                real_new_obs = vec_normalize.get_original_obs()
-
+            # Store unnormalized obs in the replay buffer.  sample(env=vec_normalize)
+            # will normalize them on the fly during training, ensuring train/inference
+            # distributions match.
+            new_original_obs = vec_normalize.get_original_obs() if vec_normalize is not None else new_obs.copy()
             self.replay_buffer.add(
-                real_obs, real_new_obs, action, reward, done, [info[0]] if isinstance(info, list) else [info],
+                _last_original_obs, new_original_obs, action, reward, done,
+                [info[0]] if isinstance(info, list) else [info],
             )
+            _last_original_obs = new_original_obs
 
             obs = new_obs
             episode_reward += float(reward[0])
@@ -532,6 +537,7 @@ class MPO:
                 episode_reward = 0.0
                 episode_length = 0
                 obs = env.reset()
+                _last_original_obs = vec_normalize.get_original_obs() if vec_normalize is not None else obs.copy()
 
                 if callback is not None:
                     callback(locals(), globals())
