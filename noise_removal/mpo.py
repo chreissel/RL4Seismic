@@ -327,8 +327,8 @@ class MPO:
             act_flat = sampled_actions.reshape(B * K, A)
             q_values = self.critic_target.min_q(obs_rep, act_flat).reshape(B, K)
 
-        # Dual optimisation for temperature η
-        eta = self.log_eta.exp()
+        # Dual optimisation for temperature η (clamped to prevent collapse)
+        eta = self.log_eta.exp().clamp(min=1e-2)
         # g(η) = η·ε + η·logsumexp(Q/η) − η·log(K)
         dual_loss_eta = (
             eta * self.epsilon
