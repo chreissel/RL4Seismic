@@ -78,6 +78,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from noise_removal import (
     DomainRandomizedNoiseCancellationEnv,
     DomainRandomizationConfig,
+    LoopShapingWrapper,
     NoiseCancellationEnv,
     SeismicConfig,
 )
@@ -166,6 +167,17 @@ def make_env(args, seed: int):
                     return obs, info
 
                 env.reset = _reset_with_freq_reward
+        if args.loop_shaping:
+            _fs = cfg.fs if args.no_dr else 4.0
+            env = LoopShapingWrapper(
+                env,
+                psd_window=args.psd_window,
+                f_low=args.freq_band_low,
+                f_high=args.freq_band_high,
+                amplification_penalty=args.amplification_penalty,
+                spectral_weight=args.spectral_weight,
+                fs=_fs,
+            )
         env = ActionSmoothnessWrapper(env, smoothness_lambda=args.smoothness_lambda)
         env = Monitor(env)
         env.reset(seed=seed)
@@ -216,6 +228,21 @@ def parse_args():
                    help="Disable band-limited reward (fall back to broadband).")
     p.add_argument("--freq-band-low", type=float, default=0.05)
     p.add_argument("--freq-band-high", type=float, default=0.5)
+
+    p.add_argument("--loop-shaping", action="store_true",
+                   help="Use frequency-domain loop-shaping reward (DLS, "
+                        "arXiv:2509.14016): reward based on the estimated "
+                        "sensitivity function |S(f)|^2 = PSD_e/PSD_y instead "
+                        "of instantaneous squared error.  Overrides --freq-reward.")
+    p.add_argument("--psd-window", type=int, default=256,
+                   help="PSD estimation window for --loop-shaping (samples, "
+                        "default: 256 = 64 s @ 4 Hz, freq resolution 0.015 Hz)")
+    p.add_argument("--amplification-penalty", type=float, default=2.0,
+                   help="Weight on out-of-band amplification penalty in "
+                        "--loop-shaping reward (default: 2.0)")
+    p.add_argument("--spectral-weight", type=float, default=0.5,
+                   help="Mixing weight λ for the spectral bonus relative to "
+                        "the dense bandpass reward (default: 0.5)")
 
     p.add_argument("--target-entropy", type=float, default=-0.2,
                    help="SAC target entropy.  Default -0.2 (softer than SAC's "
@@ -286,8 +313,16 @@ def main():
           f"bilinear_rank={args.bilinear_rank})")
     print(f"  Domain randomisation: "
           f"{'OFF (drift_scale=' + str(args.drift_scale) + ')' if args.no_dr else 'ON'}")
-    print(f"  Reward          : "
-          f"{'band-limited [' + str(args.freq_band_low) + ', ' + str(args.freq_band_high) + '] Hz' if args.freq_reward else 'broadband y_t^2 - e_t^2'}")
+    if args.loop_shaping:
+        reward_desc = (f"loop-shaping |S(f)|² on [{args.freq_band_low}, "
+                       f"{args.freq_band_high}] Hz (PSD window={args.psd_window}, "
+                       f"α={args.amplification_penalty})")
+    elif args.freq_reward:
+        reward_desc = (f"band-limited [{args.freq_band_low}, "
+                       f"{args.freq_band_high}] Hz")
+    else:
+        reward_desc = "broadband y_t^2 - e_t^2"
+    print(f"  Reward          : {reward_desc}")
     print(f"  Action clip     : [-{args.action_clip}, +{args.action_clip}]")
     print(f"  Target entropy  : {args.target_entropy}  "
           f"(SAC default would be -dim(A)=-1.0)")
