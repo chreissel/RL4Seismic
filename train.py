@@ -35,7 +35,7 @@ from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import VecNormalize
 
-from noise_removal import NoiseCancellationEnv, SeismicConfig
+from noise_removal import NoiseCancellationEnv, SeismicConfig, LoopShapingWrapper
 from noise_removal.policy import DilatedCausalConvExtractor
 
 
@@ -88,6 +88,17 @@ def parse_args():
                         "on this window (Parseval-exact) instead of the "
                         "broadband RMS. Useful for coloured noise where the "
                         "broadband RMS is dominated by near-DC power.")
+    p.add_argument("--loop-shaping", action="store_true",
+                   help="Use frequency-domain loop-shaping reward (DLS, "
+                        "arXiv:2509.14016): reward based on the estimated "
+                        "sensitivity function |S(f)|^2 = PSD_e/PSD_y instead "
+                        "of instantaneous squared error.  Overrides --freq-reward.")
+    p.add_argument("--psd-window", type=int, default=256,
+                   help="PSD estimation window for --loop-shaping (samples, "
+                        "default: 256 = 64 s @ 4 Hz, freq resolution 0.015 Hz)")
+    p.add_argument("--amplification-penalty", type=float, default=2.0,
+                   help="Weight on out-of-band amplification penalty in "
+                        "--loop-shaping reward (default: 2.0)")
     p.add_argument("--dilated-conv", action="store_true",
                    help="Use dilated causal convolution policy (PPO) instead of "
                         "LSTM policy (RecurrentPPO). Inspired by DeepMind DLS.")
@@ -100,9 +111,11 @@ def parse_args():
 
 
 def make_env(config, window_size, episode_duration,
-             freq_reward=False, freq_low=0.05, freq_high=1.5):
+             freq_reward=False, freq_low=0.05, freq_high=1.5,
+             loop_shaping=False, psd_window=256,
+             amplification_penalty=2.0):
     def _init():
-        return NoiseCancellationEnv(
+        env = NoiseCancellationEnv(
             config=config,
             window_size=window_size,
             episode_duration=episode_duration,
@@ -110,6 +123,16 @@ def make_env(config, window_size, episode_duration,
             freq_band_low=freq_low,
             freq_band_high=freq_high,
         )
+        if loop_shaping:
+            env = LoopShapingWrapper(
+                env,
+                psd_window=psd_window,
+                f_low=freq_low,
+                f_high=freq_high,
+                amplification_penalty=amplification_penalty,
+                fs=config.fs,
+            )
+        return env
     return _init
 
 
@@ -166,7 +189,10 @@ def main():
     print(f"  Episode length : {args.episode_duration} s")
     print(f"  Total steps    : {args.timesteps:,}")
     print(f"  Parallel envs  : {args.n_envs}")
-    if args.freq_reward:
+    if args.loop_shaping:
+        print(f"  Reward         : loop-shaping |S(f)|² on [{args.freq_low}, {args.freq_high}] Hz "
+              f"(PSD window={args.psd_window}, α={args.amplification_penalty})")
+    elif args.freq_reward:
         print(f"  Reward         : band-limited [{args.freq_low}, {args.freq_high}] Hz")
     else:
         print(f"  Reward         : broadband squared-error improvement")
@@ -182,7 +208,10 @@ def main():
         make_env(config, window_size, args.episode_duration,
                  freq_reward=args.freq_reward,
                  freq_low=args.freq_low,
-                 freq_high=args.freq_high),
+                 freq_high=args.freq_high,
+                 loop_shaping=args.loop_shaping,
+                 psd_window=args.psd_window,
+                 amplification_penalty=args.amplification_penalty),
         n_envs=args.n_envs,
     )
     vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
