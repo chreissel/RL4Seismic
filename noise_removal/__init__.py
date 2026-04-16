@@ -5,6 +5,7 @@ from .domain_randomization import (
     DomainRandomizedNoiseCancellationEnv,
 )
 from .loop_shaping import LoopShapingWrapper
+from .mpo import MPO
 
 __all__ = [
     "SeismicConfig",
@@ -13,4 +14,5 @@ __all__ = [
     "DomainRandomizationConfig",
     "DomainRandomizedNoiseCancellationEnv",
     "LoopShapingWrapper",
+    "MPO",
 ]
