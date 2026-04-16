@@ -99,6 +99,9 @@ def parse_args():
     p.add_argument("--amplification-penalty", type=float, default=2.0,
                    help="Weight on out-of-band amplification penalty in "
                         "--loop-shaping reward (default: 2.0)")
+    p.add_argument("--spectral-weight", type=float, default=0.5,
+                   help="Mixing weight λ for the spectral bonus relative to "
+                        "the dense bandpass reward (default: 0.5)")
     p.add_argument("--dilated-conv", action="store_true",
                    help="Use dilated causal convolution policy (PPO) instead of "
                         "LSTM policy (RecurrentPPO). Inspired by DeepMind DLS.")
@@ -113,7 +116,7 @@ def parse_args():
 def make_env(config, window_size, episode_duration,
              freq_reward=False, freq_low=0.05, freq_high=1.5,
              loop_shaping=False, psd_window=256,
-             amplification_penalty=2.0):
+             amplification_penalty=2.0, spectral_weight=0.5):
     def _init():
         env = NoiseCancellationEnv(
             config=config,
@@ -130,6 +133,7 @@ def make_env(config, window_size, episode_duration,
                 f_low=freq_low,
                 f_high=freq_high,
                 amplification_penalty=amplification_penalty,
+                spectral_weight=spectral_weight,
                 fs=config.fs,
             )
         return env
@@ -211,7 +215,8 @@ def main():
                  freq_high=args.freq_high,
                  loop_shaping=args.loop_shaping,
                  psd_window=args.psd_window,
-                 amplification_penalty=args.amplification_penalty),
+                 amplification_penalty=args.amplification_penalty,
+                 spectral_weight=args.spectral_weight),
         n_envs=args.n_envs,
     )
     vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_obs=10.0)

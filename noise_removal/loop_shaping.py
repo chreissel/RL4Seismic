@@ -20,23 +20,34 @@ The empirical squared sensitivity at frequency f is estimated as:
 
 |S(f)|^2 < 1  ⟹  suppression (good);   |S(f)|^2 > 1  ⟹  amplification (bad).
 
-The per-step reward (once the buffer is full) is:
+The per-step reward blends a dense instantaneous term (per-sample
+band-limited power improvement, for temporal credit assignment) with
+a spectral shaping bonus (PSD-based sensitivity, for frequency-domain
+control):
 
-    R = mean( -log₁₀(|S(f)|²)  for f ∈ [f_low, f_high] )               [in-band]
-      - α · mean( max(0, log₁₀(|S(f)|²))  for f ∉ [f_low, f_high] )    [out-of-band]
+    R_t = R_bandpass(t)  +  λ · R_spectral(t)
+
+The spectral component is:
+
+    R_spectral = mean( -log₁₀(|S(f)|²)  for f ∈ [f_low, f_high] )
+               - α · mean( max(0, log₁₀(|S(f)|²))  for f ∉ [f_low, f_high] )
 
 The first term rewards in-band suppression (positive when |S| < 1).
 The second penalises out-of-band amplification with weight α.
-Values are in log₁₀ units (decades); multiply by 10 for dB.
 
-During the warmup period (first ``psd_window`` steps while the buffer fills),
-the wrapper passes through the base environment's reward unchanged.
+The dense bandpass term provides per-step gradient so the RL agent can
+assign credit to individual actions.  The spectral bonus nudges the
+overall closed-loop shape toward the target sensitivity profile.
+
+During the warmup period (first ``psd_window`` steps while the buffer
+fills), the spectral term is zero and only the bandpass reward is used.
 
 Usage
 -----
     from noise_removal.loop_shaping import LoopShapingWrapper
 
-    env = NoiseCancellationEnv(config=cfg, ...)
+    # Base env should have freq_reward=True for the dense bandpass component
+    env = NoiseCancellationEnv(config=cfg, freq_reward=True, ...)
     env = LoopShapingWrapper(env, psd_window=256, f_low=0.05, f_high=0.5)
 """
 
@@ -44,32 +55,31 @@ from __future__ import annotations
 
 import numpy as np
 import gymnasium as gym
+from scipy.signal import butter, sosfilt, sosfilt_zi
 
 
 class LoopShapingWrapper(gym.Wrapper):
-    """Replace the env reward with a frequency-domain loop-shaping reward.
+    """Replace the env reward with a hybrid loop-shaping reward.
 
-    Estimates the closed-loop sensitivity function from a sliding PSD
-    window and rewards in-band suppression while penalising out-of-band
-    amplification.
+    Blends a dense per-step band-limited reward (causal Butterworth
+    bandpass → instantaneous power improvement) with a spectral bonus
+    computed from the sliding-window PSD sensitivity function.
 
     Parameters
     ----------
     env : gym.Env
         Base environment (must put ``main_raw`` and ``main_clean`` in info).
     psd_window : int
-        Number of samples in the PSD estimation window.  Larger windows give
-        finer frequency resolution but longer warmup.  Default 256 (= 64 s
-        @ 4 Hz, frequency resolution 0.015 Hz, ~29 bins in [0.05, 0.5] Hz).
+        Number of samples in the PSD estimation window.  Default 256.
     f_low, f_high : float
-        Control-band edges in Hz.  The reward drives |S(f)| down inside
-        this band.  Default [0.05, 0.5] Hz (microseismic band).
+        Control-band edges in Hz.  Default [0.05, 0.5] Hz.
     amplification_penalty : float
-        Weight α on the out-of-band amplification penalty term.
-        Higher values make the agent more conservative about injecting
-        noise outside the control band.  Default 2.0.
+        Weight α on the out-of-band amplification penalty.  Default 2.0.
+    spectral_weight : float
+        Mixing weight λ for the spectral bonus relative to the dense
+        bandpass reward.  Default 0.5.
     fs : float
-        Sampling rate in Hz.  Must match the environment.  Default 4.0.
+        Sampling rate in Hz.  Default 4.0.
     """
 
     def __init__(
@@ -79,6 +89,7 @@ class LoopShapingWrapper(gym.Wrapper):
         f_low: float = 0.05,
         f_high: float = 0.5,
         amplification_penalty: float = 2.0,
+        spectral_weight: float = 0.5,
         fs: float = 4.0,
     ):
         super().__init__(env)
@@ -86,52 +97,84 @@ class LoopShapingWrapper(gym.Wrapper):
         self.f_low = f_low
         self.f_high = f_high
         self.amplification_penalty = amplification_penalty
+        self.spectral_weight = spectral_weight
         self.fs = fs
 
-        # Precompute frequency bins and band masks
+        # --- Dense bandpass reward (per-step, causal) ---
+        nyq = fs / 2.0
+        low = max(f_low, 0.01)
+        high = min(f_high, nyq * 0.99)
+        self._bp_sos = butter(4, [low, high], btype="bandpass", fs=fs, output="sos")
+
+        # --- Spectral (PSD) reward ---
+        # Frequency bins and band masks
         self._freqs = np.fft.rfftfreq(psd_window, d=1.0 / fs)
         self._in_band = (self._freqs >= f_low) & (self._freqs <= f_high)
         self._out_band = ~self._in_band & (self._freqs > 0)  # exclude DC
 
         # Hann window for spectral leakage reduction
         self._window = np.hanning(psd_window)
-        # Window power (for PSD normalisation: PSD = |FFT(x·w)|² / S₂)
         self._win_power = float(np.sum(self._window ** 2))
 
-        # Circular buffers for y_t (uncontrolled) and e_t (residual)
+        # Circular buffers
         self._y_buf = np.zeros(psd_window, dtype=np.float64)
         self._e_buf = np.zeros(psd_window, dtype=np.float64)
         self._buf_pos: int = 0
         self._buf_full: bool = False
+
+        # Bandpass filter state (initialised in reset)
+        self._bp_zi_y: np.ndarray | None = None
+        self._bp_zi_e: np.ndarray | None = None
 
     def reset(self, **kwargs):
         self._y_buf[:] = 0.0
         self._e_buf[:] = 0.0
         self._buf_pos = 0
         self._buf_full = False
+
+        # Reset causal bandpass filter states
+        zi_template = sosfilt_zi(self._bp_sos)
+        self._bp_zi_y = zi_template * 0.0
+        self._bp_zi_e = zi_template * 0.0
+
         return self.env.reset(**kwargs)
 
     def step(self, action):
-        obs, base_reward, terminated, truncated, info = self.env.step(action)
+        obs, _base_reward, terminated, truncated, info = self.env.step(action)
 
-        # Append to circular buffer
+        y_t = info["main_raw"]
+        e_t = info["main_clean"]
+
+        # --- Dense reward: causal bandpass → instantaneous power improvement ---
+        y_arr = np.array([y_t])
+        e_arr = np.array([e_t])
+        y_bp, self._bp_zi_y = sosfilt(self._bp_sos, y_arr, zi=self._bp_zi_y)
+        e_bp, self._bp_zi_e = sosfilt(self._bp_sos, e_arr, zi=self._bp_zi_e)
+        dense_reward = float(y_bp[0] ** 2 - e_bp[0] ** 2)
+
+        # --- Spectral reward: PSD-based sensitivity function ---
         idx = self._buf_pos % self.psd_window
-        self._y_buf[idx] = info["main_raw"]
-        self._e_buf[idx] = info["main_clean"]
+        self._y_buf[idx] = y_t
+        self._e_buf[idx] = e_t
         self._buf_pos += 1
         if self._buf_pos >= self.psd_window:
             self._buf_full = True
 
         if self._buf_full:
-            reward, sens_info = self._spectral_reward()
+            spectral_reward, sens_info = self._spectral_reward()
             info.update(sens_info)
         else:
-            reward = base_reward
+            spectral_reward = 0.0
+
+        reward = dense_reward + self.spectral_weight * spectral_reward
+
+        info["dense_reward"] = dense_reward
+        info["spectral_reward"] = spectral_reward
 
         return obs, reward, terminated, truncated, info
 
     def _spectral_reward(self):
-        """Compute the loop-shaping reward from the current buffer."""
+        """Compute the spectral loop-shaping bonus from the current buffer."""
         W = self.psd_window
         start = self._buf_pos % W
 
@@ -155,7 +198,7 @@ class LoopShapingWrapper(gym.Wrapper):
         sensitivity_sq = np.clip(
             (psd_e + eps) / (psd_y + eps), 1e-6, 1e6
         )
-        log_sens = np.log10(sensitivity_sq)  # in decades; ×10 for dB
+        log_sens = np.log10(sensitivity_sq)
 
         # In-band: reward suppression (positive when agent is cancelling)
         if np.any(self._in_band):
@@ -171,11 +214,11 @@ class LoopShapingWrapper(gym.Wrapper):
         else:
             amplification = 0.0
 
-        reward = in_band_suppression - self.amplification_penalty * amplification
+        spectral = in_band_suppression - self.amplification_penalty * amplification
 
         sens_info = {
-            "loop_shaping_reward": reward,
+            "loop_shaping_reward": spectral,
             "sensitivity_in_band_db": -10.0 * in_band_suppression,
             "sensitivity_out_band_db": 10.0 * amplification,
         }
-        return reward, sens_info
+        return spectral, sens_info

@@ -175,6 +175,7 @@ def make_env(args, seed: int):
                 f_low=args.freq_band_low,
                 f_high=args.freq_band_high,
                 amplification_penalty=args.amplification_penalty,
+                spectral_weight=args.spectral_weight,
                 fs=_fs,
             )
         env = ActionSmoothnessWrapper(env, smoothness_lambda=args.smoothness_lambda)
@@ -239,6 +240,9 @@ def parse_args():
     p.add_argument("--amplification-penalty", type=float, default=2.0,
                    help="Weight on out-of-band amplification penalty in "
                         "--loop-shaping reward (default: 2.0)")
+    p.add_argument("--spectral-weight", type=float, default=0.5,
+                   help="Mixing weight λ for the spectral bonus relative to "
+                        "the dense bandpass reward (default: 0.5)")
 
     p.add_argument("--target-entropy", type=float, default=-0.2,
                    help="SAC target entropy.  Default -0.2 (softer than SAC's "
