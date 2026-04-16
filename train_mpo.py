@@ -109,6 +109,7 @@ def make_env(args, seed: int):
                 f_high=args.freq_band_high,
                 amplification_penalty=args.amplification_penalty,
                 spectral_weight=args.spectral_weight,
+                mode=args.reward_mode,
                 fs=_fs,
             )
         env = ActionSmoothnessWrapper(env, smoothness_lambda=args.smoothness_lambda)
@@ -172,6 +173,10 @@ def parse_args():
     p.add_argument("--psd-window", type=int, default=256)
     p.add_argument("--amplification-penalty", type=float, default=2.0)
     p.add_argument("--spectral-weight", type=float, default=0.5)
+    p.add_argument("--reward-mode", choices=["hybrid", "segment"], default="hybrid",
+                   help="'hybrid' = dense bandpass + spectral bonus (default). "
+                        "'segment' = pure spectral, segment-level PSD reward "
+                        "(closer to the DLS paper, best for fine-tuning).")
 
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--save-path", default="models/mpo_bilinear")
@@ -225,9 +230,10 @@ def main():
     )
 
     if args.loop_shaping:
-        reward_desc = (f"loop-shaping |S(f)|² on [{args.freq_band_low}, "
-                       f"{args.freq_band_high}] Hz (PSD window={args.psd_window}, "
-                       f"α={args.amplification_penalty}, λ={args.spectral_weight})")
+        reward_desc = (f"loop-shaping |S(f)|² [{args.freq_band_low}, "
+                       f"{args.freq_band_high}] Hz (mode={args.reward_mode}, "
+                       f"PSD={args.psd_window}, α={args.amplification_penalty}"
+                       f"{', λ=' + str(args.spectral_weight) if args.reward_mode == 'hybrid' else ''})")
     else:
         reward_desc = "broadband y_t^2 - e_t^2"
 
