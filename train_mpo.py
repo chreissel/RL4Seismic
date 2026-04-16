@@ -108,7 +108,7 @@ def make_env(args, seed: int):
                 f_low=args.freq_band_low,
                 f_high=args.freq_band_high,
                 amplification_penalty=args.amplification_penalty,
-                spectral_weight=args.spectral_weight,
+                mode=args.reward_mode,
                 fs=_fs,
             )
         env = ActionSmoothnessWrapper(env, smoothness_lambda=args.smoothness_lambda)
@@ -153,6 +153,9 @@ def parse_args():
                    help="Number of action samples K per state in E-step")
     p.add_argument("--gamma", type=float, default=0.999)
     p.add_argument("--tau", type=float, default=0.005)
+    p.add_argument("--n-step", type=int, default=3,
+                   help="N-step returns for the critic (default: 3). "
+                        "Propagates reward signal faster over long episodes.")
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--buffer-size", type=int, default=200_000)
     p.add_argument("--train-freq", type=int, default=1)
@@ -171,7 +174,9 @@ def parse_args():
     p.add_argument("--freq-band-high", type=float, default=0.5)
     p.add_argument("--psd-window", type=int, default=256)
     p.add_argument("--amplification-penalty", type=float, default=2.0)
-    p.add_argument("--spectral-weight", type=float, default=0.5)
+    p.add_argument("--reward-mode", default="segment",
+                   help="Reward mode: 'segment' = pure spectral, segment-level "
+                        "PSD reward (default, matches the DLS paper).")
 
     p.add_argument("--seed", type=int, default=1)
     p.add_argument("--save-path", default="models/mpo_bilinear")
@@ -216,6 +221,7 @@ def main():
         n_action_samples=args.n_action_samples,
         gamma=args.gamma,
         tau=args.tau,
+        n_step=args.n_step,
         batch_size=args.batch_size,
         buffer_size=args.buffer_size,
         learning_starts=args.learning_starts,
@@ -225,9 +231,10 @@ def main():
     )
 
     if args.loop_shaping:
-        reward_desc = (f"loop-shaping |S(f)|² on [{args.freq_band_low}, "
-                       f"{args.freq_band_high}] Hz (PSD window={args.psd_window}, "
-                       f"α={args.amplification_penalty}, λ={args.spectral_weight})")
+        reward_desc = (f"loop-shaping |S(f)|² [{args.freq_band_low}, "
+                       f"{args.freq_band_high}] Hz (mode={args.reward_mode}, "
+                       f"PSD={args.psd_window}, α={args.amplification_penalty}"
+                       f"{', λ=' + str(args.spectral_weight) if args.reward_mode == 'hybrid' else ''})")
     else:
         reward_desc = "broadband y_t^2 - e_t^2"
 
@@ -241,7 +248,7 @@ def main():
     print(f"  Reward          : {reward_desc}")
     print(f"  Action clip     : [-{args.action_clip}, +{args.action_clip}]")
     print(f"  MPO ε={args.epsilon}, ε_μ={args.epsilon_mean}, ε_σ={args.epsilon_var}")
-    print(f"  K={args.n_action_samples} action samples, γ={args.gamma}, τ={args.tau}")
+    print(f"  K={args.n_action_samples} action samples, γ={args.gamma}, τ={args.tau}, n_step={args.n_step}")
     print(f"  Device          : {model.device}")
 
     if args.checkpoint_freq > 0:
