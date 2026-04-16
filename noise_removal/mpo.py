@@ -266,16 +266,24 @@ class MPO:
         self.critic_target.requires_grad_(False)
 
         # --- Dual variables (learnable, optimised on log scale) ---
-        self.log_eta = nn.Parameter(torch.tensor(1.0, device=self.device))
+        # α_μ and α_σ are persistent (adapt across batches)
         self.log_alpha_mean = nn.Parameter(torch.tensor(1.0, device=self.device))
         self.log_alpha_var = nn.Parameter(torch.tensor(1.0, device=self.device))
+
+        # --- Target actor (Polyak-averaged, for stable TD targets) ---
+        self.actor_target = copy.deepcopy(self.actor)
+        self.actor_target.requires_grad_(False)
 
         # --- Optimisers ---
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr_actor)
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr_critic)
         self.dual_optimizer = torch.optim.Adam(
-            [self.log_eta, self.log_alpha_mean, self.log_alpha_var], lr=lr_dual
+            [self.log_alpha_mean, self.log_alpha_var], lr=lr_dual
         )
+
+        # η is solved per-batch, not learned across batches
+        self._eta_init = 1.0
+        self._eta_n_iters = 5
 
         # --- Replay buffer (SB3) ---
         from stable_baselines3.common.buffers import ReplayBuffer
@@ -291,6 +299,31 @@ class MPO:
     # Core training
     # ------------------------------------------------------------------
 
+    def _solve_eta(self, q_values: torch.Tensor) -> torch.Tensor:
+        """Solve the E-step dual for η on normalized Q-values (per-batch).
+
+        Minimises g(η) = η·ε + η·logsumexp(Q/η) − η·log(K) using a few
+        steps of gradient descent on log(η).  Solved fresh each batch so
+        η cannot drift across batches.
+        """
+        K = q_values.shape[1]
+        q_detached = q_values.detach()
+        with torch.enable_grad():
+            log_eta = torch.tensor(
+                np.log(self._eta_init), dtype=torch.float32, device=self.device,
+                requires_grad=True,
+            )
+            opt = torch.optim.Adam([log_eta], lr=5e-2)
+            for _ in range(self._eta_n_iters):
+                eta = log_eta.exp()
+                loss = eta * self.epsilon + eta * (
+                    torch.logsumexp(q_detached / eta, dim=1) - np.log(K)
+                ).mean()
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+        return log_eta.exp().detach().clamp(min=1e-4)
+
     def train_step(self):
         """One gradient update: critic + E-step + M-step + dual update."""
         data = self.replay_buffer.sample(self.batch_size)
@@ -300,9 +333,9 @@ class MPO:
         next_obs = data.next_observations
         dones = data.dones.squeeze(-1)
 
-        # ---------- Critic update (TD target with target network) ----------
+        # ---------- Critic update (TD target with target actor + target critic) ----------
         with torch.no_grad():
-            next_actions = self.actor.sample(next_obs, n=1).squeeze(1)
+            next_actions = self.actor_target.sample(next_obs, n=1).squeeze(1)
             next_actions = next_actions.clamp(self._act_low, self._act_high)
             q_target = self.critic_target.min_q(next_obs, next_actions)
             td_target = rewards + self.gamma * (1.0 - dones) * q_target
@@ -312,40 +345,39 @@ class MPO:
 
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
+        nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
         self.critic_optimizer.step()
 
         # ---------- E-step: find non-parametric improved policy ----------
         with torch.no_grad():
-            # Sample K actions per state from the current (old) policy
             sampled_actions = self.actor.sample(obs, n=self.n_action_samples)
-            # (batch, K, act_dim)
             sampled_actions = sampled_actions.clamp(self._act_low, self._act_high)
 
-            # Evaluate Q for each (s, a_k) pair
             B, K, A = sampled_actions.shape
             obs_rep = obs.unsqueeze(1).expand(-1, K, -1).reshape(B * K, -1)
             act_flat = sampled_actions.reshape(B * K, A)
             q_values = self.critic_target.min_q(obs_rep, act_flat).reshape(B, K)
 
-        # Dual optimisation for temperature η (clamped to prevent collapse)
-        eta = self.log_eta.exp().clamp(min=1e-2)
-        # g(η) = η·ε + η·logsumexp(Q/η) − η·log(K)
-        dual_loss_eta = (
-            eta * self.epsilon
-            + eta * (torch.logsumexp(q_values / eta, dim=1) - np.log(K)).mean()
-        )
+            # Normalize Q-values per state (zero-mean, unit-variance) so η
+            # controls relative sharpness regardless of the Q-value scale.
+            # This is the proper fix for η collapse — without it, η must
+            # track the growing Q-spread and eventually hits zero.
+            q_mean = q_values.mean(dim=1, keepdim=True)
+            q_std = q_values.std(dim=1, keepdim=True).clamp(min=1e-6)
+            q_normalized = (q_values - q_mean) / q_std
 
-        # Compute normalised weights w_k = softmax(Q_k / η)
+        # Solve for temperature η on the normalized Q-values (per-batch)
+        eta = self._solve_eta(q_normalized)
+
+        # Compute normalised weights w_k = softmax(Q_norm_k / η)
         with torch.no_grad():
-            weights = F.softmax(q_values / eta.detach(), dim=1)  # (B, K)
+            weights = F.softmax(q_normalized / eta, dim=1)  # (B, K)
 
         # ---------- M-step: weighted MLE with KL constraints ----------
-        # Get old policy parameters (detached)
         with torch.no_grad():
             old_mean, old_log_std = self.actor(obs)
             old_std = old_log_std.exp()
 
-        # Get new policy parameters
         new_mean, new_log_std = self.actor(obs)
         new_std = new_log_std.exp()
 
@@ -354,45 +386,41 @@ class MPO:
         log_probs = new_dist.log_prob(sampled_actions).sum(dim=-1)  # (B, K)
         policy_loss = -(weights.detach() * log_probs).sum(dim=1).mean()
 
-        # Decoupled KL constraints (mean and variance separately)
-        # KL_mean = 0.5 * Σ_d (μ_new - μ_old)² / σ_old²
+        # Decoupled KL constraints
         kl_mean = 0.5 * (((new_mean - old_mean) / old_std) ** 2).sum(dim=-1).mean()
-        # KL_var = 0.5 * Σ_d (σ_old²/σ_new² + log(σ_new²/σ_old²) - 1)
         var_ratio = (old_std / new_std) ** 2
         kl_var = 0.5 * (var_ratio + 2 * (new_log_std - old_log_std) - 1).sum(dim=-1).mean()
 
         alpha_mean = self.log_alpha_mean.exp()
         alpha_var = self.log_alpha_var.exp()
 
-        # Actor loss with Lagrangian KL penalties
         actor_loss = (
             policy_loss
             + alpha_mean.detach() * kl_mean
             + alpha_var.detach() * kl_var
         )
 
-        # Dual loss for α_μ, α_σ (enforce constraints)
-        dual_loss_alpha = (
+        # Dual loss for α_μ, α_σ (gradient ascent on the Lagrangian)
+        dual_loss_alpha = -(
             alpha_mean * (self.epsilon_mean - kl_mean.detach())
             + alpha_var * (self.epsilon_var - kl_var.detach())
         )
 
         # ---------- Optimise ----------
-        # Actor
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
         nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
         self.actor_optimizer.step()
 
-        # Dual variables (η, α_μ, α_σ)
-        total_dual_loss = dual_loss_eta - dual_loss_alpha
         self.dual_optimizer.zero_grad()
-        total_dual_loss.backward()
+        dual_loss_alpha.backward()
         self.dual_optimizer.step()
 
-        # ---------- Soft target update ----------
+        # ---------- Soft target update (both critic and actor) ----------
         with torch.no_grad():
             for p, p_tgt in zip(self.critic.parameters(), self.critic_target.parameters()):
+                p_tgt.data.lerp_(p.data, self.tau)
+            for p, p_tgt in zip(self.actor.parameters(), self.actor_target.parameters()):
                 p_tgt.data.lerp_(p.data, self.tau)
 
         self._n_updates += 1
@@ -500,7 +528,6 @@ class MPO:
                           f"steps {self.num_timesteps:>7,} | "
                           f"ep_rew {episode_reward:>10.1f} | "
                           f"mean_rew(10) {mean_r:>10.1f} | "
-                          f"eta {self.log_eta.exp().item():.3f} | "
                           f"n_updates {self._n_updates}")
                 episode_reward = 0.0
                 episode_length = 0
@@ -534,12 +561,12 @@ class MPO:
         """Save model parameters to ``path``.zip."""
         data = {
             "actor_state_dict": self.actor.state_dict(),
+            "actor_target_state_dict": self.actor_target.state_dict(),
             "critic_state_dict": self.critic.state_dict(),
             "critic_target_state_dict": self.critic_target.state_dict(),
             "actor_optimizer": self.actor_optimizer.state_dict(),
             "critic_optimizer": self.critic_optimizer.state_dict(),
             "dual_optimizer": self.dual_optimizer.state_dict(),
-            "log_eta": self.log_eta.data.cpu(),
             "log_alpha_mean": self.log_alpha_mean.data.cpu(),
             "log_alpha_var": self.log_alpha_var.data.cpu(),
             "num_timesteps": self.num_timesteps,
@@ -555,12 +582,15 @@ class MPO:
             path = path + ".zip"
         data = torch.load(path, map_location=self.device, weights_only=False)
         self.actor.load_state_dict(data["actor_state_dict"])
+        if "actor_target_state_dict" in data:
+            self.actor_target.load_state_dict(data["actor_target_state_dict"])
+        else:
+            self.actor_target.load_state_dict(data["actor_state_dict"])
         self.critic.load_state_dict(data["critic_state_dict"])
         self.critic_target.load_state_dict(data["critic_target_state_dict"])
         self.actor_optimizer.load_state_dict(data["actor_optimizer"])
         self.critic_optimizer.load_state_dict(data["critic_optimizer"])
         self.dual_optimizer.load_state_dict(data["dual_optimizer"])
-        self.log_eta.data = data["log_eta"].to(self.device)
         self.log_alpha_mean.data = data["log_alpha_mean"].to(self.device)
         self.log_alpha_var.data = data["log_alpha_var"].to(self.device)
         self.num_timesteps = data.get("num_timesteps", 0)
