@@ -196,7 +196,7 @@ def main():
     vec_env = VecNormalize(
         vec_env,
         norm_obs=True,
-        norm_reward=True,
+        norm_reward=False,
         clip_obs=10.0,
     )
 
